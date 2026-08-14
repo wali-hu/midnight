@@ -1,0 +1,29 @@
+{
+  "name": "phantom-midnight-contracts",
+  "private": true,
+  "type": "module",
+  "description": "Compact contracts for Phantom on Midnight. See ../../SESSION-LOG-2026-08-08.md.",
+  "scripts": {
+    "build:notepool": "compact compile src/NotePool.compact build",
+    "build:mandate": "compact compile src/MandateRegistry.compact build-mandate",
+    "build:deposit": "compact compile src/DepositAttest.compact build-deposit",
+    "build": "npm run build:notepool && npm run build:mandate && npm run build:deposit && npm run build:job && npm run build:ppt && npm run build:registry",
+    "build:ppt": "compact compile src/PPT.compact build-ppt",
+    "test:ppt": "node test/ppt.test.mjs",
+    "test:mutate:ppt": "node test/ppt.mutate.mjs",
+    "test:notepool": "node test/notepool.test.mjs",
+    "test:mandate": "node test/mandate.test.mjs",
+    "test:deposit": "node test/deposit-attest.test.mjs",
+    "test:e2e": "node test/e2e-architecture.mjs",
+    "test": "npm run test:notepool && npm run test:mandate && npm run test:deposit && npm run test:job && npm run test:ppt && npm run test:registry && npm run test:e2e",
+    "test:mutate": "node test/deposit-attest.mutate.mjs",
+    "build:job": "compact compile src/JobContract.compact build-job",
+    "test:job": "node test/jobcontract.test.mjs",
+    "build:registry": "compact compile src/RelayerRegistry.compact build-registry",
+    "test:registry": "node test/registry.test.mjs",
+    "test:mutate:registry": "node test/registry.mutate.mjs"
+  },
+  "dependencies": {
+    "@midnight-ntwrk/compact-runtime": "^0.16.0"
+  }
+}

@@ -1,0 +1,11 @@
+node_modules/
+dist/
+build*/
+*.log
+# Secret-shaped files, by pattern rather than by path.
+**/*.key
+**/*.pem
+**/*seed
+**/.env
+**/.env.*
+!**/.env.example

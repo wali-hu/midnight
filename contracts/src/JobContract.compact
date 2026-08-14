@@ -1,0 +1,320 @@
+// JobContract - the agreement between two parties, moved out of our database and onto Midnight.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// WHY THIS EXISTS
+//
+// `core/ARCHITECTURE.md` §4: the project is to move the parts that only work because a server is
+// trusted. The spending limit became a proof (MandateRegistry). The payment record became a signed,
+// anchored chain. **This is the last one: the contract between two parties.**
+//
+// Today it is a row in `jobs` (migration 013). That row says what the work is, how much it pays, by
+// when, and - critically - WHO IS OWED. A row we can edit. This contract is the same agreement with
+// the same fields, except that nobody, including us, can change it after it is made.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// THE MONEY IS NOT IN HERE, AND THAT IS THE POINT
+//
+// `08-Job-Payments-Design.md`: *"you do not need to move the money. You need to unlock the key."*
+//
+//     skJob   = H(sA ‖ sB)        the payer's half and the worker's half
+//     ownerPk = Poseidon(skJob)
+//
+// The funds sit in ONE ordinary note on whichever execution chain holds them, owned by that joint
+// key. Neither party can spend it alone. Settling is **releasing a half**, not transferring value.
+//
+// So this contract holds no balance, mints nothing, and cannot pay anyone. It decides ONE thing:
+// **whose half gets released.** That is why there is no escrow contract anywhere in this system, no
+// gas per job, and no published amount.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// THE COMMITMENTS ARE TAKEN BEFORE ANYTHING IS REVEALED
+//
+// `payerHalfCommit` and `workerHalfCommit` are recorded at creation. Without that, a party could
+// wait to see the other's half and then re-roll its own - the joint key would be whatever the second
+// mover wanted. Migration 013 says the same thing in SQL, for the same reason.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// A DEADLINE IS THE ONLY FAIR TRIGGER FOR NON-DELIVERY - AND IT IS PUBLIC
+//
+// ⚠️ SECONDS. NOT MILLISECONDS. MEASURED, NOT ASSUMED.
+// `kernel.blockTime*` compares against the chain clock in **seconds since the epoch**, while every
+// JavaScript source of a timestamp (`Date.now()`, and the indexer's `block.timestamp`) is in
+// MILLISECONDS. Passing milliseconds makes the comparison meaningless in a way that looks like it
+// works: a ms value is ~1000x too large, so `blockTimeLessThan(t)` is ALWAYS TRUE and
+// `blockTimeGreaterThan(t)` is ALWAYS FALSE. The contract compiles, the simulator passes, and on a
+// real chain the deadline simply never fires.
+//
+// (An earlier version of this note added "(its clock is in ms)" as the reason the simulator passes.
+// That parenthetical is wrong and was removed 2026-08-12 after measuring it. On compact-runtime
+// 0.16.0 the simulator's block clock is `secondsSinceEpoch` - SECONDS - and it is sampled ONCE, when
+// the CircuitContext is created:
+//     blockTime > now-1h in SECONDS -> PASS        the same two values in MS -> FAIL
+//     blockTime > now+1h in SECONDS -> FAIL
+//     sleeping N seconds and re-calling on the SAME context -> the clock has not moved
+//     createCircuitContext(..., time) sets it explicitly, as a NUMBER OF SECONDS
+// The conclusion still holds, for the right reason: a ms value is ~1000x too large, so
+// `blockTimeLessThan(ms)` is true against ANY sane clock. The distinction matters because a deadline
+// IS testable here - not by sleeping, which measures nothing, but by re-entering the same state in a
+// later block. See test/registry.test.mjs.)
+// Verified on devnet with `tools/time-probe.mjs`:
+//     blockTime > 1786205454      → PASS   (seconds)
+//     blockTime > 1786205454000   → FAIL   (milliseconds)
+// Anything written into this field must be `Math.floor(Date.now() / 1000)`.
+//
+//
+// Nobody can prove a negative: "he never delivered" is not demonstrable on any chain. A deadline is
+// the only trigger that does not need a judge. But Compact's only time primitive is
+// `kernel.blockTimeGreaterThan(t)` / `blockTimeLessThan(t)`, and `t` is a KERNEL ARGUMENT - a public
+// boundary. So **the deadline is public**, exactly as MandateRegistry's expiry is. Everything else
+// about the job - parties, amount, spec - stays private. Say this plainly rather than implying the
+// whole agreement is hidden.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// WHAT IS PUBLIC, HONESTLY
+//
+//   public : that a job exists (one commitment), that it was accepted/refunded (one nullifier),
+//            and each job's deadline
+//   private: the parties, the amount, the asset, the spec, and which job any given settlement is
+//
+// Two jobs of the same payer are unlinkable: like MandateRegistry, the live state is a NOTE that is
+// consumed and recreated, never a Map entry keyed by the job.
+
+pragma language_version >= 0.23;
+
+import CompactStandardLibrary;
+
+// Jobs ever created. A tree, not a Set: membership is proved with a path, so acting on a job never
+// reveals WHICH job. A Set would require disclosing the key.
+export ledger jobs: HistoricMerkleTree<20, Bytes<32>>;
+
+// Live job states. Same shape, same reason.
+export ledger states: HistoricMerkleTree<20, Bytes<32>>;
+
+// Nullifiers of consumed states. This is what makes a job settle exactly once, and what stops a
+// party rewinding to an earlier state.
+export ledger settled: Set<Bytes<32>>;
+
+// Domain separation for this deployment. Sealed: set once, never again.
+export sealed ledger registryId: Bytes<32>;
+
+constructor(id: Bytes<32>) {
+  registryId = disclose(id);
+}
+
+// ── witnesses (untrusted: every value must be checked against something already trusted) ──
+witness payerSecret(): Bytes<32>;     // the payer's identity key
+witness workerSecret(): Bytes<32>;    // the worker's identity key
+witness jobSecret(): Bytes<32>;       // shared payer↔worker: derives state randomness
+witness jobRand(): Bytes<32>;         // blinding for the job commitment
+
+// The job being acted on, opened from the holder's own records.
+witness jobPayerPk(): Bytes<32>;
+witness jobWorkerPk(): Bytes<32>;
+// ⚠️ 128 BITS, AND IT MUST STAY THAT WAY. Amounts are in WEI.
+// This was Uint<64>, which caps a job at 18.446744073709551615 tokens on any 18-decimal asset -
+// 2^64-1 wei. Nothing asserts on the amount (it only enters `jobCommit`), so the failure is not a
+// wrong number: the runtime refuses the out-of-range witness and the job simply cannot be created.
+// It went unnoticed because the test used `amount: 250n` - 250 WEI, which fits, and reads like
+// "250 tokens". 128 bits covers 3.4e20 tokens at 18 decimals, which is more than any ERC-20 supply.
+witness jobAmount(): Uint<128>;
+witness jobAssetId(): Uint<64>;
+witness jobSpecHash(): Bytes<32>;
+witness jobDeadline(): Uint<64>;   // SECONDS since the epoch - see the header, this bit us
+witness jobPayerHalfCommit(): Bytes<32>;
+witness jobWorkerHalfCommit(): Bytes<32>;
+
+// Membership proofs. Both come from witnesses and both are bound to a value we derived.
+witness jobPath(commitment: Bytes<32>): MerkleTreePath<20, Bytes<32>>;
+witness statePath(commitment: Bytes<32>): MerkleTreePath<20, Bytes<32>>;
+
+// The state note being consumed.
+witness stateStatus(): Uint<64>;   // see the status constants below
+witness stateStep(): Uint<64>;
+
+// ── status ──────────────────────────────────────────────────────────────────
+// Deliberately plain integers rather than an enum: the value is hashed into a commitment, and a
+// commitment must mean the same thing in ten years. An enum's ordinals are a compiler detail.
+//   0 created   1 delivered   2 accepted (terminal)   3 refunded (terminal)
+
+// ── derivations ─────────────────────────────────────────────────────────────
+// Each has its own domain separator. Sharing one would let an observer compute one value from
+// another and link things that must stay unlinkable.
+
+export circuit payerPk(secret: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<3, Bytes<32>>>([pad(32, "phantom:job:payer:"), registryId, secret]);
+}
+
+export circuit workerPk(secret: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<3, Bytes<32>>>([pad(32, "phantom:job:worker:"), registryId, secret]);
+}
+
+// The half-commitments. Taken before either half is revealed - see the header.
+//
+// `registryId` is in here for the same reason it is in every other derivation: without it the same
+// half produces the same commitment on every deployment, so a commitment from a test registry would
+// verify against a live network. Domain separation costs nothing and its absence is invisible until it
+// matters. (It also makes this circuit read ledger state, which is why it is impure like the rest -
+// a pure circuit would have been a quiet inconsistency in the generated API.)
+export circuit halfCommit(half: Bytes<32>, rand: Bytes<32>): Bytes<32> {
+  return persistentCommit<Vector<3, Bytes<32>>>([pad(32, "phantom:job:half:"), registryId, half], rand);
+}
+
+// The job itself. Every term is bound in, so a party cannot later open the same job with a bigger
+// amount or a later deadline - the same binding that stops NotePool's amount being re-opened.
+//
+// persistentCommit over a Vector of 10 is the widest commitment in this codebase; if it ever needs
+// another field, add it here rather than smuggling it into an existing one.
+export circuit jobCommit(
+  pPk: Bytes<32>, wPk: Bytes<32>, amount: Uint<128>, assetId: Uint<64>,
+  specHash: Bytes<32>, deadline: Uint<64>,
+  pHalf: Bytes<32>, wHalf: Bytes<32>, rand: Bytes<32>,
+): Bytes<32> {
+  return persistentCommit<Vector<9, Bytes<32>>>(
+    [pad(32, "phantom:job:cm:"), registryId, pPk, wPk,
+     amount as Field as Bytes<32>, assetId as Field as Bytes<32>,
+     specHash, deadline as Field as Bytes<32>,
+     persistentHash<Vector<2, Bytes<32>>>([pHalf, wHalf])],
+    rand
+  );
+}
+
+// State randomness, derived so BOTH parties can reconstruct the live state - the worker to deliver,
+// the payer to accept or to refund. Neither can be locked out by the other losing a file.
+export circuit stateRand(secret: Bytes<32>, step: Uint<64>): Bytes<32> {
+  return persistentHash<Vector<4, Bytes<32>>>(
+    [pad(32, "phantom:job:srand:"), registryId, secret, step as Field as Bytes<32>]
+  );
+}
+
+export circuit stateCommit(jobCm: Bytes<32>, status: Uint<64>, rand: Bytes<32>): Bytes<32> {
+  return persistentCommit<Vector<4, Bytes<32>>>(
+    [pad(32, "phantom:job:state:"), registryId, jobCm, status as Field as Bytes<32>],
+    rand
+  );
+}
+
+// Nullifier of a state note. Derived from the SHARED job secret, because both parties must be able
+// to move the job forward.
+export circuit stateNullifier(secret: Bytes<32>, stateCm: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<4, Bytes<32>>>(
+    [pad(32, "phantom:job:snul:"), registryId, secret, stateCm]
+  );
+}
+
+// ── shared checks ───────────────────────────────────────────────────────────
+
+// Re-derive the job from the holder's witnesses and prove it was really created.
+circuit openJob(): Bytes<32> {
+  const jCm = jobCommit(
+    jobPayerPk(), jobWorkerPk(), jobAmount(), jobAssetId(),
+    jobSpecHash(), jobDeadline(), jobPayerHalfCommit(), jobWorkerHalfCommit(), jobRand()
+  );
+  const p = jobPath(jCm);
+  // ⚠️ THE LINE THAT MAKES THIS SOUND - same as NotePool's. `merkleTreePathRoot` starts from
+  // `path.leaf`, and the path is a WITNESS, so checkRoot alone proves only that SOME job exists.
+  // This binds the membership proof to the job we just derived.
+  assert(disclose(p.leaf == jCm), "job path is not for this job");
+  assert(jobs.checkRoot(disclose(merkleTreePathRoot<20, Bytes<32>>(p))), "job was never created");
+  return jCm;
+}
+
+// Consume the live state note: prove it is in the tree, then nullify it.
+circuit consumeState(jCm: Bytes<32>, jSecret: Bytes<32>, status: Uint<64>, step: Uint<64>): [] {
+  const sCm = stateCommit(jCm, status, stateRand(jSecret, step));
+  const sp = statePath(sCm);
+  assert(disclose(sp.leaf == sCm), "state path is not for this state");
+  assert(states.checkRoot(disclose(merkleTreePathRoot<20, Bytes<32>>(sp))), "state note not in tree");
+
+  const nul = stateNullifier(jSecret, sCm);
+  // Publishing the nullifier is the point: it is what makes a job settle exactly once.
+  assert(disclose(!settled.member(disclose(nul))), "this job state was already used");
+  settled.insert(disclose(nul));
+}
+
+// ── circuits ────────────────────────────────────────────────────────────────
+
+// The payer creates the job. Authorisation is the proof: the job binds `payerPk`, and only someone
+// holding `payerSecret` can produce a commitment that opens to it. Note the absence of
+// `ownPublicKey()` - it is a WITNESS on Midnight and authorises nobody.
+//
+// On-chain this is one leaf in `jobs` and one leaf in `states`. Nothing about the parties, the
+// amount, the asset or the spec is readable.
+export circuit create(): [] {
+  const pPk = payerPk(payerSecret());
+  assert(disclose(pPk == jobPayerPk()), "not the payer named in this job");
+
+  // A job that is already expired can never be delivered and can only ever be refunded. Creating one
+  // is a mistake, not an attack - but it is a mistake that strands the payer's funds behind a
+  // pointless refund cycle, so it is refused here where it costs nothing.
+  assert(kernel.blockTimeLessThan(disclose(jobDeadline())), "deadline is already in the past");
+
+  const jCm = jobCommit(
+    pPk, jobWorkerPk(), jobAmount(), jobAssetId(),
+    jobSpecHash(), jobDeadline(), jobPayerHalfCommit(), jobWorkerHalfCommit(), jobRand()
+  );
+  jobs.insert(jCm);
+  states.insert(stateCommit(jCm, 0, stateRand(jobSecret(), 0)));   // status 0 = created
+}
+
+// The worker says the work is done. This is a claim, not a proof of work - no chain can verify that
+// a market-research report is good. What it does is move the job to a state where the payer's
+// acceptance is meaningful and the refund clock is the only alternative.
+export circuit deliver(): [] {
+  const jCm = openJob();
+  assert(disclose(workerPk(workerSecret()) == jobWorkerPk()), "not the worker named in this job");
+  assert(kernel.blockTimeLessThan(disclose(jobDeadline())), "the deadline has passed");
+
+  const st = stateStatus();
+  const step = stateStep();
+  assert(st == 0, "job is not in the created state");
+
+  consumeState(jCm, jobSecret(), st, step);
+  states.insert(stateCommit(jCm, 1, stateRand(jobSecret(), step + 1 as Uint<64>)));
+}
+
+// The payer accepts. THIS IS THE SETTLEMENT: the job reaches a terminal state, and off-chain the
+// payer hands over their key half, which lets the worker spend the joint note.
+//
+// The release itself is not on-chain and does not need to be. What matters is that the acceptance is
+// permanent and unforgeable: nobody can later claim it did not happen, and the payer cannot accept
+// twice or accept and then refund. `settled` guarantees that.
+export circuit accept(): [] {
+  const jCm = openJob();
+  assert(disclose(payerPk(payerSecret()) == jobPayerPk()), "only the payer can accept");
+
+  const st = stateStatus();
+  const step = stateStep();
+  // Accepting undelivered work is allowed on purpose: a payer may pay early, and forbidding it would
+  // mean a worker who delivered off-band cannot be paid without a pointless extra transaction.
+  assert(st == 0 || st == 1, "job is already settled");
+
+  consumeState(jCm, jobSecret(), st, step);
+  states.insert(stateCommit(jCm, 2, stateRand(jobSecret(), step + 1 as Uint<64>)));
+}
+
+// The payer reclaims after the deadline. The mirror image of accept, and the only remedy that needs
+// no judge - which is why disputes refund rather than adjudicate (08-Job-Payments-Design §"dispute").
+//
+// A worker who delivered late has no recourse here, and that is a deliberate, stated trade: the
+// alternative is a judge with money at risk, and that is a separate system.
+export circuit refund(): [] {
+  const jCm = openJob();
+  assert(disclose(payerPk(payerSecret()) == jobPayerPk()), "only the payer can refund");
+
+  const st = stateStatus();
+  const step = stateStep();
+
+  // ORDER MATTERS, AND NOT FOR SECURITY - FOR THE ERROR MESSAGE.
+  // Checking the deadline first meant a payer refunding an ALREADY-SETTLED job was told "the
+  // deadline has not passed yet", and would be told "already settled" only after waiting for a
+  // deadline that was never the problem. This file's callers are agents, and `api/routes/jobs.ts`
+  // states the rule: the message is the only thing an agent gets, so it must name the real cause.
+  // A settled job is finished whatever the clock says, so status is checked first.
+  assert(st == 0 || st == 1, "job is already settled");
+
+  // The ONLY place the deadline works in the payer's favour. Before it, the worker still has time.
+  assert(kernel.blockTimeGreaterThan(disclose(jobDeadline())), "the deadline has not passed yet");
+
+  consumeState(jCm, jobSecret(), st, step);
+  states.insert(stateCommit(jCm, 3, stateRand(jobSecret(), step + 1 as Uint<64>)));
+}

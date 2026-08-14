@@ -1,0 +1,270 @@
+// DepositAttest - the one edge a ZK proof cannot close on its own.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// WHY THIS CONTRACT EXISTS
+//
+// Everything else in this design is proof-bound. The relayer cannot alter a Midnight transaction
+// (`balanceFinalizedTransaction` adds only the fee), cannot redirect a payout (the BSC pool verifies
+// a user-authored Groth16 proof with the recipient bound in), and cannot move a note it does not own
+// (NotePool's leaf-binding assert). There is exactly ONE claim in the system that no proof of ours
+// can check:
+//
+//     "a deposit of `amount`, for `ownerPk`, landed on the execution chain."
+//
+// A Compact circuit cannot read BSC. Our Merkle proofs prove membership in MIDNIGHT's tree. Proving
+// a foreign chain's event inside a circuit means verifying that chain's consensus - a light client,
+// which is not v1. So this fact enters the system as an ATTESTATION, and the contract's whole job is
+// to make that attestation as expensive to abuse as possible:
+//
+//   * t-of-n, so no single operator can invent a deposit;
+//   * one deposit mints exactly ONCE, ever, even if the attesters equivocate;
+//   * the recipient is bound INTO the attested claim, so a colluding quorum cannot redirect
+//     someone else's real deposit to itself - it can only invent a new one, which is louder.
+//
+// NOTE WHAT THIS REPLACES. `NotePool.deposit(amount, blob)` mints a note of any amount to anyone who
+// calls it. That is correct for a devnet demo of the note machinery and is a money printer in
+// a live network. `mintFromDeposit` is the authenticated version, and this contract deliberately does
+// NOT export an unauthenticated `deposit`.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// THE HONEST SECURITY BOUNDARY - do not let this be paraphrased away
+//
+// This is a TRUST-MINIMISED bridge, not a trustless one. `THRESHOLD` colluding enrolled attesters
+// can mint a note for a deposit that never happened, and steal from the pool. Nothing in this
+// contract prevents that; only a light client would. What this contract buys:
+//
+//   * the collusion must be at least THRESHOLD-wide;
+//   * every attestation is a signed, public, on-chain act by a named enrolled key, so the evidence
+//     of a false attestation is permanent and anyone can act on it (this is what
+//     `slashFalseAttestation` on OperatorStake consumes);
+//   * a false claim is DISPROVABLE by anyone with a BSC node, because the claim names the exact
+//     chain, pool, tx and log index.
+//
+// Detection, not prevention. Say it that way.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// PRIVACY - what this deliberately leaks, and why that is the right trade
+//
+// `depositId` is DISCLOSED at mint. It has to be: it is the key of the `minted` set, and that set is
+// the only thing standing between attester equivocation and a double mint. Disclosing it links the
+// new commitment to a public BSC transaction.
+//
+// That is not a regression. A deposit is an entry at the pool's edge, and pool edges are public on
+// the execution chain no matter what we do (see SESSION-LOG §3.1). Privacy in this design begins
+// AFTER the note exists, when it is transferred and spent. Choosing unlinkability here instead would
+// buy nothing (the BSC tx is public anyway) and would cost soundness. Soundness wins.
+//
+// `claimKey` is published at attest time. It is a hash over (depositId, ownerPk, amount). depositId
+// and amount are already public on BSC; ownerPk is a 32-byte hash and is not recoverable from it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+pragma language_version >= 0.23;
+
+import CompactStandardLibrary;
+
+// ── the note pool (identical shape to NotePool - this IS the pool, with an honest front door) ──
+export ledger notes: HistoricMerkleTree<20, Bytes<32>>;
+export ledger nullifiers: Set<Bytes<32>>;
+export ledger noteBlobs: Map<Bytes<32>, Bytes<100>>;
+export sealed ledger poolId: Bytes<32>;
+
+// ── the attester set ──
+//
+// PUBLIC on purpose. Who is allowed to attest is not a secret; it is the thing users audit before
+// they trust the bridge. Hiding it would only hide who to blame.
+//
+// SEALED on purpose, and this mirrors `ReceiptAnchor.publisher` being immutable (SESSION-LOG §1.4).
+// An owner who can rotate the attester set can mint any deposit they like: swap in five keys you
+// control, attest, mint. Rotation is a redeploy and a migration, which is a visible, contestable act
+// rather than a silent one.
+export sealed ledger attesters: Set<Bytes<32>>;
+
+// One entry per (claim, attester). Set membership is what makes an attestation count, and the Set
+// itself is what makes an attester unable to vote twice for the same claim.
+export ledger votes: Set<Bytes<32>>;
+
+// Deposits already turned into a note. THE money-printer guard: keyed by depositId, never by claim,
+// so two contradictory claims for one deposit still yield at most one note.
+export ledger minted: Set<Bytes<32>>;
+
+constructor(id: Bytes<32>, a0: Bytes<32>, a1: Bytes<32>, a2: Bytes<32>, a3: Bytes<32>, a4: Bytes<32>) {
+  poolId = disclose(id);
+  attesters.insert(disclose(a0));
+  attesters.insert(disclose(a1));
+  attesters.insert(disclose(a2));
+  attesters.insert(disclose(a3));
+  attesters.insert(disclose(a4));
+}
+
+// ── witnesses (untrusted - every value is checked against something already trusted) ──
+witness attesterSecret(): Bytes<32>;   // proves the caller IS the enrolled attester, not just names it
+witness mintRand(): Bytes<32>;         // blinding for the minted note; sealed into the blob for the owner
+witness noteSecret(): Bytes<32>;
+witness noteRand(): Bytes<32>;
+witness notePath(commitment: Bytes<32>): MerkleTreePath<20, Bytes<32>>;
+witness outRand(): Bytes<32>;
+witness changeRand(): Bytes<32>;
+
+// ── derivations ──
+
+export circuit ownerPk(secret: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<3, Bytes<32>>>([pad(32, "phantom:note:owner:"), poolId, secret]);
+}
+
+export circuit commitFor(owner: Bytes<32>, amount: Uint<64>, rand: Bytes<32>): Bytes<32> {
+  return persistentCommit<Vector<4, Bytes<32>>>(
+    [pad(32, "phantom:note:cm:"), poolId, owner, amount as Field as Bytes<32>],
+    rand
+  );
+}
+
+circuit noteCommitment(secret: Bytes<32>, amount: Uint<64>, rand: Bytes<32>): Bytes<32> {
+  return commitFor(ownerPk(secret), amount, rand);
+}
+
+export circuit noteNullifier(secret: Bytes<32>, commitment: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<4, Bytes<32>>>(
+    [pad(32, "phantom:note:nul:"), poolId, secret, commitment]
+  );
+}
+
+// An attester's public identity. Separate domain from note owners so an attester key can never be
+// mistaken for - or replayed as - a note owner key.
+export circuit attesterPk(secret: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<3, Bytes<32>>>([pad(32, "phantom:dep:attester:"), poolId, secret]);
+}
+
+// The claim being attested to. THE RECIPIENT AND THE AMOUNT ARE INSIDE THE HASH - that is what stops
+// a quorum from re-pointing a real deposit at itself. A quorum that wants to steal has to attest to
+// a deposit that does not exist, which is refutable against BSC.
+//
+// `depositId` is the execution chain's own identifier for the event, hashed by the client as
+// H(chainId ‖ poolAddress ‖ txHash ‖ logIndex). Deriving it that way is what makes it unique across
+// chains - the same tx hash on BSC and on Base is two different deposits.
+export circuit claimKey(depositId: Bytes<32>, owner: Bytes<32>, amount: Uint<64>): Bytes<32> {
+  return persistentHash<Vector<5, Bytes<32>>>(
+    [pad(32, "phantom:dep:claim:"), poolId, depositId, owner, amount as Field as Bytes<32>]
+  );
+}
+
+// One attester's vote for one claim.
+circuit voteKey(claim: Bytes<32>, attester: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<4, Bytes<32>>>(
+    [pad(32, "phantom:dep:vote:"), poolId, claim, attester]
+  );
+}
+
+// ── circuits ──
+
+// An enrolled attester states: "I looked at the execution chain and this claim is true."
+//
+// The proof is the signature. There is no separate signature scheme here because there does not need
+// to be one: producing this transaction requires the witness `attesterSecret`, and the circuit proves
+// `attesterPk(secret) ∈ attesters`. Nobody else can produce it, so a vote in the Set is by
+// construction an enrolled attester's own act.
+//
+// FEES. An attester does not need DUST. It finalizes this transaction itself and the relayer pays
+// the fee with `balanceFinalizedTransaction`, which cannot alter the content (SESSION-LOG §3.3). The
+// relayer therefore funds the attesters without being able to speak for them.
+export circuit attest(claim: Bytes<32>): [] {
+  const pk = attesterPk(attesterSecret());
+  assert(disclose(attesters.member(disclose(pk))), "not an enrolled attester");
+
+  const vk = voteKey(claim, pk);
+  // Not merely hygiene: without it one attester reaches the threshold alone by voting THRESHOLD
+  // times, and t-of-n collapses to 1-of-n.
+  assert(disclose(!votes.member(disclose(vk))), "this attester already attested to this claim");
+  votes.insert(disclose(vk));
+}
+
+// Turn an attested deposit into a note.
+//
+// Callable by ANYONE, including the relayer, and that is safe: `owner` is bound into the claim the
+// attesters voted on, so whoever submits this, the note lands on the depositor's key. The submitter
+// pays a fee to give someone else money.
+//
+// THRESHOLD IS FIXED AT THREE, AT COMPILE TIME, and 3-of-5 is the deployed shape. A circuit has a
+// fixed size; a variable threshold would mean a variable number of membership checks. Changing t or
+// n is a new contract and a migration - the same discipline as NotePool's tree depth.
+export circuit mintFromDeposit(
+  depositId: Bytes<32>,
+  owner: Bytes<32>,
+  amount: Uint<64>,
+  blob: Bytes<100>,
+  a0: Bytes<32>,
+  a1: Bytes<32>,
+  a2: Bytes<32>,
+): [] {
+  // FIRST, before anything else. This is the line that makes attester equivocation survivable: two
+  // rogue claims for one deposit can both reach a quorum, and still only one of them ever mints.
+  assert(disclose(!minted.member(disclose(depositId))), "deposit already minted");
+
+  // Distinctness. Three references to the SAME attester is one attester, and reduces 3-of-5 to
+  // 1-of-5. The Set already stops a repeat vote; this stops a repeat *citation* of one vote.
+  assert(disclose(a0 != a1), "attesters must be distinct");
+  assert(disclose(a1 != a2), "attesters must be distinct");
+  assert(disclose(a0 != a2), "attesters must be distinct");
+
+  const ck = claimKey(depositId, owner, amount);
+
+  // Enrolment is NOT re-checked here, and that is deliberate rather than an omission: a vote can
+  // only have entered `votes` through `attest`, which proved enrolment. Membership in `votes`
+  // already implies "an enrolled attester signed this exact claim".
+  assert(disclose(votes.member(disclose(voteKey(ck, a0)))), "attester 1 has not attested this claim");
+  assert(disclose(votes.member(disclose(voteKey(ck, a1)))), "attester 2 has not attested this claim");
+  assert(disclose(votes.member(disclose(voteKey(ck, a2)))), "attester 3 has not attested this claim");
+
+  minted.insert(disclose(depositId));
+
+  // The minter chooses `rand` and seals it into the blob for the owner. Knowing the opening does NOT
+  // let the minter spend the note: spending needs the owner's SECRET, and the minter has only their
+  // public key. It does mean a malicious minter can publish a blob that will not open - the same
+  // griefing risk NotePool documents. Value destroyed, never stolen.
+  const cm = commitFor(owner, amount, mintRand());
+  notes.insert(cm);
+  noteBlobs.insert(disclose(cm), disclose(blob));
+}
+
+// ── the rest of the pool: unchanged from NotePool, including the assert that makes it sound ──
+
+export circuit spend(amount: Uint<64>): [] {
+  const secret = noteSecret();
+  const cm = noteCommitment(secret, amount, noteRand());
+
+  const p = notePath(cm);
+  // The witness chose `p`. This ties the leaf it proves to the note we just derived. See NotePool.
+  assert(disclose(p.leaf == cm), "path is not for this note");
+  assert(notes.checkRoot(disclose(merkleTreePathRoot<20, Bytes<32>>(p))), "note not in tree");
+
+  const nul = noteNullifier(secret, cm);
+  assert(disclose(!nullifiers.member(disclose(nul))), "note already spent");
+  nullifiers.insert(disclose(nul));
+}
+
+export circuit transfer(
+  payeePk: Bytes<32>,
+  amountIn: Uint<64>,
+  amountOut: Uint<64>,
+  payeeBlob: Bytes<100>,
+  changeBlob: Bytes<100>,
+): [] {
+  assert(amountOut <= amountIn, "cannot send more than the note holds");
+  const change = amountIn - amountOut as Uint<64>;
+
+  const secret = noteSecret();
+  const cm = noteCommitment(secret, amountIn, noteRand());
+  const p = notePath(cm);
+  assert(disclose(p.leaf == cm), "path is not for this note");
+  assert(notes.checkRoot(disclose(merkleTreePathRoot<20, Bytes<32>>(p))), "note not in tree");
+
+  const nul = noteNullifier(secret, cm);
+  assert(disclose(!nullifiers.member(disclose(nul))), "note already spent");
+  nullifiers.insert(disclose(nul));
+
+  const outCm = commitFor(payeePk, amountOut, outRand());
+  const changeCm = commitFor(ownerPk(secret), change, changeRand());
+  notes.insert(outCm);
+  notes.insert(changeCm);
+  noteBlobs.insert(disclose(outCm), disclose(payeeBlob));
+  noteBlobs.insert(disclose(changeCm), disclose(changeBlob));
+}

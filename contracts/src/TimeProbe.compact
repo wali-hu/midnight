@@ -1,0 +1,17 @@
+// A five-line experiment: what UNIT does kernel.blockTime* compare against?
+//
+// The docs give the signature (`Uint<64>`) and not the unit, and both JobContract's deadline and
+// MandateRegistry's expiry depend on the answer. Guessing wrong makes the check silently always-true
+// or always-false - a deadline that never fires looks exactly like a working contract until someone
+// needs it.
+pragma language_version >= 0.23;
+import CompactStandardLibrary;
+
+export ledger probes: Counter;
+
+// Passes only if the chain's block time is GREATER than `t`. Call with a seconds-scale value and a
+// milliseconds-scale value; whichever passes names the unit.
+export circuit isAfter(t: Uint<64>): [] {
+  assert(kernel.blockTimeGreaterThan(disclose(t)), "block time is NOT after t");
+  probes.increment(1);
+}

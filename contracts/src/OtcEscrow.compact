@@ -1,0 +1,289 @@
+// OtcEscrow - a maker posts a PRICE RANGE, takers fill it in PIECES, the maker collects.
+//
+// The Compact port of phantom-v2's OTC escrow (phantom-v2/CLAUDE.md, "OTC ESCROW"), which is itself
+// the ZK translation of what Uniswap v4 does when it separates "burn the position" from "collect".
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// WHY THIS CANNOT BE ONE CIRCUIT - the constraint that forces the whole shape
+//
+// A note commitment binds ONE EXACT AMOUNT. So a plain spend must know its output amount at proving
+// time, and a maker who wants "anywhere between 0.98 and 1.02, in any size, to whoever turns up"
+// would have to know the payout before any taker exists. They cannot. The order would collapse to a
+// single take-it-or-leave-it price and quantity, which is not an order book, it is a coupon.
+//
+// The way out is to stop trying to name the payout up front:
+//
+//   1. postOrder  the maker's note is consumed for a zero-value TICKET. The value moves into
+//                 `escrows[ticket]` with the band. No output note is created - there is nothing
+//                 truthful to put in one yet.
+//   2. fillOrder  a taker takes ANY PART, at a price THEY choose inside the band. Repeats, with
+//                 different takers at different prices. Each fill mints the taker's note, whose
+//                 amount IS known at that moment.
+//   3. claim      the maker opens the ticket and takes proceeds + unsold remainder as two notes,
+//                 both amounts now known.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// THE TICKET IS THE CLAIM KEY, AND IT IS DELIBERATELY NOT A MERKLE LEAF
+//
+// `escrows` is keyed by the ticket, so the KEY is public - that is fine and necessary, because a
+// taker must be able to find an order to fill. What is private is the OPENING: only the maker holds
+// `ticketRand`, and `claim` re-derives the ticket from it. Publicity identifies the order; the
+// opening authorises it.
+//
+// ⚠️ The ticket is never inserted into `notes`. It is not a note, it has no amount, and nothing on
+// chain or in any database can reconstruct it - only the owner holds `r`. On BSC this is why the
+// frontend REFUSES to post an order if the ticket backup fails: losing an unposted order costs
+// nothing, losing the ticket strands BOTH the proceeds and the unsold remainder, permanently. Any
+// client built on this contract inherits that rule.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// THE PRICE CHECK USES MULTIPLICATION, NEVER DIVISION
+//
+// The obvious form is `price = payAmount / fillAmount` then compare to the band. Integer division
+// TRUNCATES, and a truncating price check is one an attacker tunes: pick a small `fillAmount` and
+// the rounding is worth more than the spread. Worse, it fails silently - every individual trade
+// looks in-band.
+//
+// So the taker states BOTH amounts and the circuit checks the implied price by cross-multiplying:
+//
+//     priceMin * fillAmount  <=  payAmount * SCALE  <=  priceMax * fillAmount
+//
+// No division, no rounding, and the comparison happens on the WIDE type the compiler gives `*`
+// before anything is narrowed - the same discipline PPT.compact uses for its supply cap.
+
+pragma language_version >= 0.23;
+
+import CompactStandardLibrary;
+
+// Price is quoted in BUY units per SELL unit, scaled by 1e6 - the same 6 decimals as NIGHT and PPT.
+// A compile-time constant: changing it re-prices every open order, so it is chosen once.
+export pure circuit priceScale(): Uint<64> {
+  return 1000000;
+}
+
+struct Escrow {
+  remaining: Uint<64>,    // SELL-asset units still unsold. Only ever decreases.
+  proceeds: Uint<64>,     // BUY-asset units taken in. Only ever increases.
+  priceMin: Uint<64>,     // inclusive band, both ends
+  priceMax: Uint<64>,
+  assetSell: Uint<64>,
+  assetBuy: Uint<64>,
+  open: Boolean,          // false once claimed - a claimed order is not a fillable order
+}
+
+// The note tree. Separate from NotePool's because a note here carries an ASSET: an escrow trades one
+// asset for another, and a commitment that does not bind the asset would let a taker pay in the
+// cheap side and be credited in the dear one.
+export ledger notes: HistoricMerkleTree<20, Bytes<32>>;
+export ledger nullifiers: Set<Bytes<32>>;
+export ledger noteBlobs: Map<Bytes<32>, Bytes<100>>;
+
+// Open and historical orders, keyed by ticket. Public on purpose: an order nobody can see is an
+// order nobody can fill.
+export ledger escrows: Map<Bytes<32>, Escrow>;
+
+export sealed ledger poolId: Bytes<32>;
+
+constructor(id: Bytes<32>) {
+  poolId = disclose(id);
+}
+
+// ── witnesses (untrusted - each is checked against something already trusted) ──
+witness noteSecret(): Bytes<32>;
+witness noteRand(): Bytes<32>;
+witness noteAmount(): Uint<64>;
+witness noteAsset(): Uint<64>;
+witness notePath(commitment: Bytes<32>): MerkleTreePath<20, Bytes<32>>;
+
+witness ticketRand(): Bytes<32>;      // the maker's claim key. Never leaves the maker.
+witness outRand(): Bytes<32>;
+witness changeRand(): Bytes<32>;
+witness proceedsRand(): Bytes<32>;
+
+// ── derivations ────────────────────────────────────────────────────────────────
+
+export circuit ownerPk(secret: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<3, Bytes<32>>>([pad(32, "phantom:otc:owner:"), poolId, secret]);
+}
+
+// A note here binds ASSET as well as amount - see the `notes` declaration above.
+export circuit commitFor(owner: Bytes<32>, asset: Uint<64>, amount: Uint<64>, rand: Bytes<32>): Bytes<32> {
+  return persistentCommit<Vector<5, Bytes<32>>>(
+    [pad(32, "phantom:otc:cm:"), poolId, owner, asset as Field as Bytes<32>, amount as Field as Bytes<32>],
+    rand
+  );
+}
+
+export circuit noteNullifier(secret: Bytes<32>, commitment: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<4, Bytes<32>>>([pad(32, "phantom:otc:nul:"), poolId, secret, commitment]);
+}
+
+// The ticket. A DIFFERENT domain separator from a note commitment, so a ticket can never be mistaken
+// for - or replayed as - a note, in either direction.
+//
+// ⚠️ EVERY PARAMETER GOES IN THE VECTOR. The first version of this took `priceMax` as an argument and
+// then left it OUT of the commitment - seven slots for eight values. It compiled, and the happy path
+// (post → fill → fill → claim) passed completely, because nothing on that path re-derives the ticket
+// with a different band.
+//
+// What it actually meant: two orders differing ONLY in `priceMax` produce the SAME ticket. The maker
+// could not post the second one at all (`postOrder` refuses a duplicate ticket), and the ticket -
+// which is supposed to BE the order's identity - was not binding the order. An argument that is
+// accepted and then ignored is worse than one that is missing: the signature says it is bound.
+//
+// Caught by `claiming with DIFFERENT parameters than were posted is REJECTED`, which is why that
+// test exists.
+export circuit ticketFor(
+  owner: Bytes<32>, assetSell: Uint<64>, assetBuy: Uint<64>,
+  amount: Uint<64>, priceMin: Uint<64>, priceMax: Uint<64>, rand: Bytes<32>,
+): Bytes<32> {
+  return persistentCommit<Vector<8, Bytes<32>>>(
+    [pad(32, "phantom:otc:ticket:"), poolId, owner,
+     assetSell as Field as Bytes<32>, assetBuy as Field as Bytes<32>,
+     amount as Field as Bytes<32>,
+     priceMin as Field as Bytes<32>, priceMax as Field as Bytes<32>],
+    rand
+  );
+}
+
+// ── shared checks ──────────────────────────────────────────────────────────────
+
+/**
+ * Consume the caller's note: prove it exists, prove it is THEIRS, nullify it.
+ *
+ * ⚠️ `assert(p.leaf == cm)` is the line that makes this sound. `merkleTreePathRoot` starts from
+ * `path.leaf`, and the path is a WITNESS - so checkRoot alone proves only that SOME leaf is in the
+ * tree, not that it is yours. Tree leaves are public, so without this binding anyone could present
+ * someone else's leaf, derive a nullifier from their OWN secret, and spend a note they never owned.
+ * NotePool.compact carries the same line for the same reason; the published Midnight example omits
+ * it, where it is latent because spending moves no value. Here it would mint money.
+ */
+circuit consumeNote(secret: Bytes<32>, asset: Uint<64>, amount: Uint<64>, rand: Bytes<32>): [] {
+  const cm = commitFor(ownerPk(secret), asset, amount, rand);
+  const p = notePath(cm);
+  assert(disclose(p.leaf == cm), "merkle path is not for this note");
+  assert(notes.checkRoot(disclose(merkleTreePathRoot<20, Bytes<32>>(p))), "note is not in the tree");
+  const nul = noteNullifier(secret, cm);
+  assert(disclose(!nullifiers.member(disclose(nul))), "note is already spent");
+  nullifiers.insert(disclose(nul));
+}
+
+// ── circuits ───────────────────────────────────────────────────────────────────
+
+/**
+ * Post an order. The maker's note is consumed and NO output note is created - the value is now in
+ * `escrows[ticket]` and the only way back out is `claim`.
+ */
+export circuit postOrder(
+  assetSell: Uint<64>, assetBuy: Uint<64>, amount: Uint<64>,
+  priceMin: Uint<64>, priceMax: Uint<64>,
+): [] {
+  assert(disclose(amount) > 0, "an order for nothing is not an order");
+  assert(disclose(assetSell) != disclose(assetBuy), "an order cannot trade an asset for itself");
+  assert(disclose(priceMin) <= disclose(priceMax), "price band is inverted");
+  assert(disclose(priceMin) > 0, "a price band starting at zero lets a taker fill for free");
+
+  const secret = noteSecret();
+  consumeNote(secret, assetSell, amount, noteRand());
+
+  const ticket = ticketFor(ownerPk(secret), assetSell, assetBuy, amount, priceMin, priceMax, ticketRand());
+  assert(disclose(!escrows.member(disclose(ticket))), "this ticket already exists");
+
+  escrows.insert(disclose(ticket), Escrow {
+    remaining: disclose(amount), proceeds: 0,
+    priceMin: disclose(priceMin), priceMax: disclose(priceMax),
+    assetSell: disclose(assetSell), assetBuy: disclose(assetBuy),
+    open: true,
+  });
+}
+
+/**
+ * Fill part (or all) of an open order, at a price the TAKER picks inside the band.
+ *
+ * The taker pays from their own BUY-asset note and receives a SELL-asset note. Their change comes
+ * back as a second note, so a taker never has to hold an exact-sized note to trade.
+ */
+export circuit fillOrder(ticket: Bytes<32>, fillAmount: Uint<64>, payAmount: Uint<64>): [] {
+  assert(disclose(escrows.member(disclose(ticket))), "no such order");
+  const e = escrows.lookup(disclose(ticket));
+  assert(e.open, "this order has been claimed and is closed");
+
+  assert(disclose(fillAmount) > 0, "a fill of nothing");
+  assert(disclose(fillAmount) <= e.remaining, "fill exceeds what is left of the order");
+
+  // THE PRICE BAND, by cross-multiplication - see the header for why not division. Both products are
+  // computed on the wide type `*` yields, so neither can wrap before the comparison.
+  const scaled = disclose(payAmount) * priceScale();
+  assert(scaled >= e.priceMin * disclose(fillAmount), "price is below the maker's band");
+  assert(scaled <= e.priceMax * disclose(fillAmount), "price is above the maker's band");
+
+  // The taker's own funds. `noteAmount`/`noteAsset` are witnesses, so they are checked by being
+  // rebuilt into the commitment that consumeNote proves is in the tree - a taker who lies about
+  // either produces a commitment that is not there.
+  const takerSecret = noteSecret();
+  const takerAsset = noteAsset();
+  const takerAmount = noteAmount();
+  assert(disclose(takerAsset) == e.assetBuy, "you must pay in the asset the maker is buying");
+  assert(disclose(takerAmount) >= disclose(payAmount), "your note does not cover the payment");
+  consumeNote(takerSecret, takerAsset, takerAmount, noteRand());
+
+  // What the taker bought, and their change.
+  const takerPk = ownerPk(takerSecret);
+  notes.insert(commitFor(takerPk, e.assetSell, disclose(fillAmount), outRand()));
+  const change = (disclose(takerAmount) - disclose(payAmount)) as Uint<64>;
+  notes.insert(commitFor(takerPk, e.assetBuy, change, changeRand()));
+
+  escrows.insert(disclose(ticket), Escrow {
+    remaining: (e.remaining - disclose(fillAmount)) as Uint<64>,
+    proceeds: (e.proceeds + disclose(payAmount)) as Uint<64>,
+    priceMin: e.priceMin, priceMax: e.priceMax,
+    assetSell: e.assetSell, assetBuy: e.assetBuy,
+    open: true,
+  });
+}
+
+/**
+ * The maker collects: proceeds in the buy asset, unsold remainder in the sell asset, as two notes.
+ *
+ * Authorisation is the OPENING, not the key. Re-deriving the ticket from the maker's secret and
+ * `ticketRand` is only possible for the maker - `escrows` being a public map is what lets takers
+ * find the order, and gives a claimant nothing.
+ */
+export circuit claim(
+  assetSell: Uint<64>, assetBuy: Uint<64>, amount: Uint<64>,
+  priceMin: Uint<64>, priceMax: Uint<64>,
+): [] {
+  const secret = noteSecret();
+  const ticket = ticketFor(ownerPk(secret), assetSell, assetBuy, amount, priceMin, priceMax, ticketRand());
+
+  assert(disclose(escrows.member(disclose(ticket))), "no such order - wrong opening or wrong parameters");
+  const e = escrows.lookup(disclose(ticket));
+  assert(e.open, "this order has already been claimed");
+
+  const makerPk = ownerPk(secret);
+  // Both notes are minted even when one is zero. A zero-amount note is harmless and costs one leaf;
+  // branching on the amount would make the number of leaves reveal whether the order filled fully,
+  // which is exactly the kind of shape an observer reads an order book from.
+  notes.insert(commitFor(makerPk, e.assetBuy, e.proceeds, proceedsRand()));
+  notes.insert(commitFor(makerPk, e.assetSell, e.remaining, outRand()));
+
+  // Closed, not deleted. The record is the audit trail, and a deleted key could be re-posted with a
+  // stale ticket - `postOrder`'s "already exists" check would then pass on a ticket that had already
+  // paid out once.
+  escrows.insert(disclose(ticket), Escrow {
+    remaining: 0, proceeds: 0,
+    priceMin: e.priceMin, priceMax: e.priceMax,
+    assetSell: e.assetSell, assetBuy: e.assetBuy,
+    open: false,
+  });
+}
+
+/** Publish an encrypted opening next to a commitment, so the owner can find and spend it later. */
+export circuit publishBlob(commitment: Bytes<32>, blob: Bytes<100>): [] {
+  noteBlobs.insert(disclose(commitment), disclose(blob));
+}
+
+/** Mint the first notes so a fresh deployment can be exercised. TESTNET ONLY - see F2. */
+export circuit faucetNote(owner: Bytes<32>, asset: Uint<64>, amount: Uint<64>): [] {
+  notes.insert(commitFor(disclose(owner), disclose(asset), disclose(amount), outRand()));
+}

@@ -1,0 +1,300 @@
+// NotePool - private notes on Midnight.
+//
+// A note is (owner, amount, randomness). Its commitment goes into a Merkle tree; spending it
+// publishes a nullifier. An observer sees commitments and nullifiers but cannot link them.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// THE SOUNDNESS FIX - read this before changing `spend`
+//
+// `merkleTreePathRoot(path)` computes the root starting from `path.leaf`:
+//
+//     root() = fold(degrade_to_transient(leaf_hash(&self.leaf)), ...)   // midnight-ledger
+//
+// and `MerkleTreePath<n,T>` carries that leaf:
+//
+//     struct MerkleTreePath<#n, T> { leaf: T; path: Vector<n, MerkleTreePathEntry>; }
+//
+// The path comes from a WITNESS, which is untrusted (docs: witnesses "are not cryptographically
+// verified"). So `checkRoot(merkleTreePathRoot(path))` alone proves only that SOME leaf is in the
+// tree - not that it is *your* note. A spender could pass anyone's leaf (tree leaves are public),
+// derive a nullifier from their own secret, and spend a note they never owned.
+//
+// `assert(path.leaf == commitment)` is what binds the membership proof to the note being spent.
+// Without that line this contract mints money. The published NullifierDoubleSpend example omits it;
+// there it is latent because spending moves no value. Here it would be fatal.
+// ─────────────────────────────────────────────────────────────────────────────
+
+pragma language_version >= 0.23;
+
+import CompactStandardLibrary;
+
+// Depth 20 → 1,048,576 notes. COMPILE-TIME CONSTANT: changing it means a new contract and a
+// migration, so it is chosen once. Matches the depth Phantom used on BSC.
+export ledger notes: HistoricMerkleTree<20, Bytes<32>>;
+
+// Spent markers. Public by design - this is what the network checks to stop a double-spend.
+export ledger nullifiers: Set<Bytes<32>>;
+
+// ── note blobs: the thing that makes a note recoverable and a payment deliverable ──
+//
+// A commitment alone is useless to its owner. To SPEND a note you need its opening - (amount, rand)
+// - because the commitment, the nullifier and the Merkle path are all derived from it. So:
+//
+//   * a payee who is only handed `commitFor(payeePk, amount, rand)` on-chain cannot spend it, and
+//   * an owner restoring from seed alone cannot find their own notes, not even their own change.
+//
+// Losing an opening is not a bug you can patch: the money is gone for everyone, forever. This
+// project has already stranded a real user's funds twice on BSC for exactly this reason.
+//
+// The fix is a blob: the opening, encrypted to the recipient, published next to the commitment.
+// Recovery = walk the blobs, try to decrypt each one, keep the ones that open. Layout and crypto
+// live in tools/notes.mjs; on-chain this is opaque bytes.
+//
+// ⚠️ THE CIRCUIT DOES NOT VERIFY THE BLOB. It cannot: decryption needs the recipient's key. A
+// malicious payer can publish a blob that does not open, and the payee's note becomes unspendable -
+// value destroyed, not stolen. That is a griefing attack we accept in v1 and must document; the
+// defence is that a payer gains nothing, plus an out-of-band copy of the opening.
+export ledger noteBlobs: Map<Bytes<32>, Bytes<100>>;
+
+// Domain separation for this deployment. Sealed: set once in the constructor, never again.
+export sealed ledger poolId: Bytes<32>;
+
+constructor(id: Bytes<32>) {
+  poolId = disclose(id);
+}
+
+// ── witnesses (untrusted: every value must be checked against something we already trust) ──
+witness noteSecret(): Bytes<32>;                                        // owner key
+witness noteRand(): Bytes<32>;                                          // input note's blinding
+witness notePath(commitment: Bytes<32>): MerkleTreePath<20, Bytes<32>>; // membership proof
+witness outRand(): Bytes<32>;                                           // blinding for the payee's note
+witness changeRand(): Bytes<32>;                                        // blinding for the change note
+
+// The two halves of a JOINTLY-OWNED note. Each belongs to a different party and neither party - nor
+// the facilitator - ever holds both until the job is settled. See the JOINT OWNERSHIP block below.
+witness jointSecretA(): Bytes<32>;                                      // payer's half
+witness jointSecretB(): Bytes<32>;                                      // worker's half
+
+// ── derivations ──
+//
+// Commitment and nullifier use DIFFERENT domain separators. Sharing one would let an observer
+// compute a commitment from a nullifier and link them, which is the whole privacy property.
+
+// Note commitment. Binds owner, amount AND the blinding factor.
+//
+// `amount` is bound in on purpose: without it the commitment says nothing about value, and a note
+// could be re-opened for any amount. It is a circuit parameter, which is a PLONK private input -
+// it never reaches the public transcript unless disclosed.
+//
+// persistentCommit (not persistentHash) because the amount space is small and guessable; the
+// blinding factor is what hides it. persistentCommit also clears witness taint on its output, so
+// the commitment needs no disclose() when inserted.
+// Owner public key. Only the holder of `secret` can produce it, but anyone can be PAID at it -
+// which is what makes a transfer to someone else possible: the payer never learns the payee's
+// secret, only this value.
+export circuit ownerPk(secret: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<3, Bytes<32>>>([pad(32, "phantom:note:owner:"), poolId, secret]);
+}
+
+// Commitment for a note payable to `owner`. Split out from ownerPk() so a payer can build a note
+// for a payee they cannot authenticate as.
+//
+// EXPORTED so a recovering wallet can recompute a commitment with the contract's own hash rather
+// than a reimplementation in TypeScript. A blob that opens is only a claim; recomputing the
+// commitment and demanding it equal the on-chain leaf is what makes it evidence. Reimplementing
+// Poseidon in JS to do that check would put the very thing being verified at risk of drift.
+export circuit commitFor(owner: Bytes<32>, amount: Uint<64>, rand: Bytes<32>): Bytes<32> {
+  return persistentCommit<Vector<4, Bytes<32>>>(
+    [pad(32, "phantom:note:cm:"), poolId, owner, amount as Field as Bytes<32>],
+    rand
+  );
+}
+
+circuit noteCommitment(secret: Bytes<32>, amount: Uint<64>, rand: Bytes<32>): Bytes<32> {
+  return commitFor(ownerPk(secret), amount, rand);
+}
+
+// Nullifier. Deterministic (no randomness) so one note always yields one nullifier.
+// Bound to the commitment as well as the secret, so two notes of the same owner nullify separately.
+//
+// EXPORTED so a recovered wallet can work out which of its notes are already spent, by deriving each
+// note's nullifier and looking it up in the public set. Deriving it needs the SECRET, so exporting
+// leaks nothing - and it means "spent" is read from the chain rather than from a server-side flag
+// that can drift. That drift is precisely the bug that broke withdrawals on BSC.
+export circuit noteNullifier(secret: Bytes<32>, commitment: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<4, Bytes<32>>>(
+    [pad(32, "phantom:note:nul:"), poolId, secret, commitment]
+  );
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// JOINT OWNERSHIP - a note NOBODY can spend alone
+//
+// The requirement: two agents agree a job, the payment locks, and it releases only when the work is
+// done. Nobody has to be trusted - not the counterparty, and not the facilitator running this.
+//
+// ── THE CONSTRUCTION THAT WAS WRONG ──
+// `agent-payments/08-Job-Payments-Design.md` originally wrote the joint key as
+//
+//     skJob = H(sA ‖ sB);  owner = ownerPk(skJob)
+//
+// and claimed it needed no circuit change. It does not lock. To CREATE the note somebody has to
+// compute `owner`, and hashing is not homomorphic, so that somebody must know BOTH halves - and can
+// then spend it alone. The lock was never closed; it only moved to a different holder. In the
+// facilitator today that holder is us: `jobSync.ts` derives both halves from one master secret.
+//
+// ── THE CONSTRUCTION THAT DOES ──
+// Hash the PUBLIC halves, not the secret ones:
+//
+//     pkA = ownerPk(sA)          A generates sA locally and never sends it
+//     pkB = ownerPk(sB)          B generates sB locally and never sends it
+//     owner = jointOwnerPk(pkA, pkB)      ← computable by ANYONE from public values
+//
+//   * the note can be funded without anyone learning a secret - a payer just passes this as
+//     `payeePk` to `transfer`, so funding needs NO new circuit
+//   * A cannot spend it: has sA, needs sB
+//   * B cannot spend it: has sB, needs sA
+//   * we cannot spend it: we never see either half
+//
+// Settlement is A handing sB… no - A handing *its own* sA to B, who then holds both and calls
+// `claimJoint`. A dispute is resolved the same way, by a verifier quorum releasing Shamir shares of
+// one half to the winner. Nothing here moves money on a verdict; it only completes a key.
+//
+// ── WHY THIS IS SOUND ──
+// `claimJoint` takes both halves as WITNESSES, which are untrusted. Someone holding only sA can
+// invent an sB - but then `jointOwnerPk` differs, so the commitment differs, so no leaf in the tree
+// matches it and `p.leaf == cm` fails. Passing the REAL note's path with a commitment derived from a
+// forged half fails on the same line. That assert is doing the same load-bearing work here as it
+// does in `spend` (see the header).
+// ═════════════════════════════════════════════════════════════════════════════
+
+// Owner of a jointly-held note, from the two PUBLIC halves.
+//
+// EXPORTED because the payer must compute it off-chain to fund the note, and neither party may be
+// asked for a secret to do so. A separate domain separator from `ownerPk` and `commitFor` so a joint
+// owner can never collide with a single owner - the arity differs too, but do not rely on that alone.
+export circuit jointOwnerPk(pkA: Bytes<32>, pkB: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<4, Bytes<32>>>(
+    [pad(32, "phantom:note:joint:"), poolId, pkA, pkB]
+  );
+}
+
+// Nullifier for a joint note. Needs BOTH halves, so it cannot be precomputed by one party - which
+// matters: a nullifier published early would tell an observer the job existed before it settled.
+// Its own domain separator, so it cannot be confused with a single-owner nullifier.
+circuit jointNullifier(sA: Bytes<32>, sB: Bytes<32>, commitment: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<5, Bytes<32>>>(
+    [pad(32, "phantom:note:jnul:"), poolId, sA, sB, commitment]
+  );
+}
+
+// Claim a jointly-owned note into a note owned by `payeePk`.
+//
+// Whoever calls this holds BOTH halves, which is only true after settlement: the counterparty handed
+// theirs over, or a verifier quorum released enough Shamir shares of it. The winner picks their own
+// output note, so the payout is not something anyone else can redirect.
+//
+// There is no partial claim and no change note: a job's payment is one amount, agreed up front and
+// frozen in `jobSpecHash`. Splitting it would let one side settle for less than was agreed.
+export circuit claimJoint(payeePk: Bytes<32>, amount: Uint<64>, blob: Bytes<100>): [] {
+  const sA = jointSecretA();
+  const sB = jointSecretB();
+
+  // Rebuild the owner from the two halves. Getting either one wrong changes this value, hence the
+  // commitment, hence the leaf - and the membership proof below cannot be satisfied.
+  const owner = jointOwnerPk(ownerPk(sA), ownerPk(sB));
+  const cm = commitFor(owner, amount, noteRand());
+
+  const p = notePath(cm);
+  // Same load-bearing assert as `spend`. Without it, holding one half plus any other note's path
+  // would be enough to spend a note you do not own.
+  assert(disclose(p.leaf == cm), "path is not for this joint note");
+  assert(notes.checkRoot(disclose(merkleTreePathRoot<20, Bytes<32>>(p))), "joint note not in tree");
+
+  const nul = jointNullifier(sA, sB, cm);
+  assert(disclose(!nullifiers.member(disclose(nul))), "joint note already spent");
+  nullifiers.insert(disclose(nul));
+
+  const outCm = commitFor(payeePk, amount, outRand());
+  notes.insert(outCm);
+  noteBlobs.insert(disclose(outCm), disclose(blob));
+}
+
+// ── circuits ──
+
+// Create a note of `amount`, publishing its sealed opening alongside.
+// On-chain: one new leaf and one 100-byte blob. The amount and the owner stay inside the proof;
+// the blob is ciphertext, and only the holder of the matching key can tell it apart from noise.
+export circuit deposit(amount: Uint<64>, blob: Bytes<100>): [] {
+  const cm = noteCommitment(noteSecret(), amount, noteRand());
+  // No disclose(): persistentCommit already cleared the taint.
+  notes.insert(cm);
+  // disclose(): `blob` is a circuit parameter, so it carries witness taint, and a Map write is a
+  // ledger operation. Publishing it IS the point - it is sealed before it ever reaches here.
+  noteBlobs.insert(disclose(cm), disclose(blob));
+}
+
+// Spend a note of `amount`.
+export circuit spend(amount: Uint<64>): [] {
+  const secret = noteSecret();
+  const cm = noteCommitment(secret, amount, noteRand());
+
+  const p = notePath(cm);
+
+  // ⚠️ THE LINE THAT MAKES THIS SOUND. See the header. The witness chose `p`; this ties the leaf it
+  // proves to the note we just derived. Remove it and anyone can spend anyone's note.
+  assert(disclose(p.leaf == cm), "path is not for this note");
+
+  // Now the membership proof means "THIS note is in the tree".
+  assert(notes.checkRoot(disclose(merkleTreePathRoot<20, Bytes<32>>(p))), "note not in tree");
+
+  const nul = noteNullifier(secret, cm);
+  // disclose() required: persistentHash does NOT clear taint, and Set ops are ledger operations.
+  // Publishing the nullifier is the point - it is what prevents the double-spend.
+  assert(disclose(!nullifiers.member(disclose(nul))), "note already spent");
+  nullifiers.insert(disclose(nul));
+}
+
+// Private transfer: consume one note, create two - the payee's and the payer's change.
+//
+// VALUE CONSERVATION IS PROVED HERE, IN THE CIRCUIT. amountIn and amountOut are private inputs, so
+// nothing about the sums reaches the chain; what the chain gets is a proof that one note was
+// nullified and two commitments were inserted whose values sum to the input. A server-side check
+// would be defence in depth, never the guarantee - the client is not trusted.
+//
+// `payeePk` is the payee's ownerPk(). The payer cannot derive it (that needs the payee's secret);
+// they are simply given it, the way an address is given.
+export circuit transfer(
+  payeePk: Bytes<32>,
+  amountIn: Uint<64>,
+  amountOut: Uint<64>,
+  payeeBlob: Bytes<100>,
+  changeBlob: Bytes<100>,
+): [] {
+  // Checked BEFORE the subtraction below: an underflow here would silently mint an enormous
+  // change note out of nothing.
+  assert(amountOut <= amountIn, "cannot send more than the note holds");
+  const change = amountIn - amountOut as Uint<64>;
+
+  // ── consume the input note (same discipline as spend) ──
+  const secret = noteSecret();
+  const cm = noteCommitment(secret, amountIn, noteRand());
+  const p = notePath(cm);
+  assert(disclose(p.leaf == cm), "path is not for this note");
+  assert(notes.checkRoot(disclose(merkleTreePathRoot<20, Bytes<32>>(p))), "note not in tree");
+
+  const nul = noteNullifier(secret, cm);
+  assert(disclose(!nullifiers.member(disclose(nul))), "note already spent");
+  nullifiers.insert(disclose(nul));
+
+  // ── create the outputs ──
+  // Both leaves are inserted unconditionally, so an observer cannot tell a full transfer (change
+  // of zero) from a partial one by counting leaves. Same reason both blobs always go out: two
+  // commitments and two blobs, every single time, whoever is paying whom.
+  const outCm = commitFor(payeePk, amountOut, outRand());
+  const changeCm = commitFor(ownerPk(secret), change, changeRand());
+  notes.insert(outCm);
+  notes.insert(changeCm);
+  noteBlobs.insert(disclose(outCm), disclose(payeeBlob));
+  noteBlobs.insert(disclose(changeCm), disclose(changeBlob));
+}

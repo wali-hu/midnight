@@ -1,0 +1,17 @@
+{
+  "when": "2026-08-11T20:04:25.210Z",
+  "network": "preview",
+  "address": "mn_addr_preview1w7g086ljmy3f9rwjsatph8vxzc00n32svqrd9khumzrupd65msws7sxm48",
+  "nightTotal": "7500000000",
+  "utxosBefore": 2,
+  "registeredBefore": 2,
+  "dustBefore": "6728573302499975981",
+  "accrualPerDayPerNight": 0.7143,
+  "moved": false,
+  "moveError": "Cannot read properties of undefined (reading 'type')",
+  "utxosAfter": 0,
+  "registeredAfter": 0,
+  "nightAfter": "0",
+  "verdict": "INCONCLUSIVE - the move did not happen",
+  "unchanged": false
+}

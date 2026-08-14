@@ -1,0 +1,270 @@
+// MandateRegistry - a principal authorises an agent to spend, and the agent proves compliance
+// without revealing the mandate.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// WHY THIS EXISTS
+//
+// PhantomPay already does agent budgets on BSC - as a Postgres row:
+//
+//     SELECT per_tx_limit, per_day_limit FROM budgets WHERE agent_id = $1   // server-side
+//
+// The agent stays inside its budget because a SERVER stops it. Remove the trust in that server and
+// the guarantee evaporates; and the limit, the principal and the counterparty list sit in a database
+// in the clear. Here the same rule becomes a PROOF: nobody is trusted, and none of those values ever
+// reach the chain.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// THE DESIGN PROBLEM THIS SOLVES: how to carry "spent so far" without letting the agent rewind
+//
+// The obvious design - a running total in a ledger Map keyed by the mandate - leaks badly: every
+// spend touches the same key, so an observer can count and link an agent's payments even though the
+// amounts are hidden.
+//
+// So the running total is a NOTE. Each spend consumes the current state note (publishing its
+// nullifier) and creates the next one with the new total. Two spends of the same mandate look like
+// two unrelated notes. Rewinding is impossible for the same reason a double-spend is: the old
+// state's nullifier is already in the set.
+//
+// The whole soundness of that rests on the same line NotePool needed:
+//     assert(path.leaf == commitment)
+// because `merkleTreePathRoot(path)` starts from `path.leaf`, and the path comes from an untrusted
+// witness. Without it an agent could prove membership using SOMEBODY ELSE's state note.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// WHAT IS PUBLIC, HONESTLY
+//
+//   hidden : limit, principal identity, agent identity, allow-list, amount, spent-so-far,
+//            which mandate a spend belongs to, which counterparty was paid
+//   public : the number of mandates issued, the number of spends, and **the mandate's expiry**
+//
+// The expiry is public because the only time primitive Compact gives us is
+// `kernel.blockTimeLessThan(t)`, and `t` is a kernel argument - a public boundary. A private
+// deadline would need a comparison against a private value, which the kernel does not offer.
+// Mitigation, not implemented here: round expiries to a coarse bucket (e.g. the day) so that many
+// mandates share one, making the value a poor identifier.
+// ─────────────────────────────────────────────────────────────────────────────
+
+pragma language_version >= 0.23;
+
+import CompactStandardLibrary;
+
+// Depth 20 → ~1M mandates and ~1M state notes. Compile-time constant: changing it is a new contract.
+export ledger mandates: HistoricMerkleTree<20, Bytes<32>>;
+
+// Running-total notes. One live note per mandate at any time; issue() creates the first.
+export ledger states: HistoricMerkleTree<20, Bytes<32>>;
+
+// Nullifiers of consumed state notes. This set is what makes rewinding and replay impossible.
+export ledger spentStates: Set<Bytes<32>>;
+
+// Domain separation for this deployment. Sealed: set once, never again.
+export sealed ledger registryId: Bytes<32>;
+
+constructor(id: Bytes<32>) {
+  registryId = disclose(id);
+}
+
+// ── witnesses (untrusted: each one must be checked against something already trusted) ──
+witness principalSecret(): Bytes<32>;   // only the principal has it - issues and revokes
+witness agentSecret(): Bytes<32>;       // only the agent has it - spends
+witness mandateSecret(): Bytes<32>;     // shared principal↔agent: derives state randomness
+witness mandateRand(): Bytes<32>;       // blinding for the mandate commitment
+
+// The mandate being acted on, opened from the holder's own records.
+witness mandateLimit(): Uint<64>;
+witness mandateExpiry(): Uint<64>;   // SECONDS since the epoch - see the note below
+// A Field, not Bytes<32>: `merkleTreePathRoot` returns `MerkleTreeDigest { field: Field }`, and the
+// allow-list root must be comparable to it without a lossy cast.
+witness mandateAllowRoot(): Field;
+witness mandatePrincipalPk(): Bytes<32>;
+witness mandateAgentPk(): Bytes<32>;
+
+// Membership proofs. All three come from witnesses and all three are bound to a value we derived.
+witness mandatePath(commitment: Bytes<32>): MerkleTreePath<20, Bytes<32>>;
+witness statePath(commitment: Bytes<32>): MerkleTreePath<20, Bytes<32>>;
+witness allowPath(counterparty: Bytes<32>): MerkleTreePath<8, Bytes<32>>;   // 256 counterparties
+
+// The state note being consumed: how much has been spent, and which step in the chain it is.
+witness stateSpent(): Uint<64>;
+witness stateStep(): Uint<64>;
+
+//
+// ⚠️ SECONDS. NOT MILLISECONDS. MEASURED, NOT ASSUMED.
+// `kernel.blockTime*` compares against the chain clock in **seconds since the epoch**, while every
+// JavaScript source of a timestamp (`Date.now()`, and the indexer's `block.timestamp`) is in
+// MILLISECONDS. Passing milliseconds makes the comparison meaningless in a way that looks like it
+// works: a ms value is ~1000x too large, so `blockTimeLessThan(t)` is ALWAYS TRUE and
+// `blockTimeGreaterThan(t)` is ALWAYS FALSE. The contract compiles, the simulator passes, and on a
+// real chain the deadline simply never fires.
+//
+// (An earlier version of this note added "(its clock is in ms)" as the reason the simulator passes.
+// That parenthetical is wrong and was removed 2026-08-12 after measuring it. On compact-runtime
+// 0.16.0 the simulator's block clock is `secondsSinceEpoch` - SECONDS - and it is sampled ONCE, when
+// the CircuitContext is created:
+//     blockTime > now-1h in SECONDS -> PASS        the same two values in MS -> FAIL
+//     blockTime > now+1h in SECONDS -> FAIL
+//     sleeping N seconds and re-calling on the SAME context -> the clock has not moved
+//     createCircuitContext(..., time) sets it explicitly, as a NUMBER OF SECONDS
+// The conclusion still holds, for the right reason: a ms value is ~1000x too large, so
+// `blockTimeLessThan(ms)` is true against ANY sane clock. The distinction matters because a deadline
+// IS testable here - not by sleeping, which measures nothing, but by re-entering the same state in a
+// later block. See test/registry.test.mjs.)
+// Verified on devnet with `tools/time-probe.mjs`:
+//     blockTime > 1786205454      → PASS   (seconds)
+//     blockTime > 1786205454000   → FAIL   (milliseconds)
+// Anything written into this field must be `Math.floor(Date.now() / 1000)`.
+//
+// (Found 2026-08-08 while building JobContract. This contract's expiry check had the same defect:
+// its simulator test passed and its on-chain expiry could never have fired.)
+
+// ── derivations ────────────────────────────────────────────────────────────────
+// Every derivation carries its own domain separator. Sharing one would let an observer compute one
+// value from another and link things that must stay unlinkable.
+
+export circuit principalPk(secret: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<3, Bytes<32>>>([pad(32, "phantom:mandate:principal:"), registryId, secret]);
+}
+
+export circuit agentPk(secret: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<3, Bytes<32>>>([pad(32, "phantom:mandate:agent:"), registryId, secret]);
+}
+
+// The mandate itself. Binding limit, expiry and allow-list root INTO the commitment is what stops an
+// agent from opening the same mandate with a bigger limit later - exactly the trick that a note's
+// amount binding stops in NotePool.
+export circuit mandateCommit(
+  pPk: Bytes<32>, aPk: Bytes<32>, limit: Uint<64>, expiry: Uint<64>, allowRoot: Field,
+  rand: Bytes<32>,
+): Bytes<32> {
+  return persistentCommit<Vector<7, Bytes<32>>>(
+    [pad(32, "phantom:mandate:cm:"), registryId, pPk, aPk,
+     limit as Field as Bytes<32>, expiry as Field as Bytes<32>, allowRoot as Bytes<32>],
+    rand
+  );
+}
+
+// State randomness, derived so BOTH parties can reconstruct the live state note: the agent to spend
+// it, the principal to revoke it. Neither can be locked out by the other losing a file.
+export circuit stateRand(secret: Bytes<32>, step: Uint<64>): Bytes<32> {
+  return persistentHash<Vector<4, Bytes<32>>>(
+    [pad(32, "phantom:mandate:srand:"), registryId, secret, step as Field as Bytes<32>]
+  );
+}
+
+export circuit stateCommit(mCm: Bytes<32>, spent: Uint<64>, rand: Bytes<32>): Bytes<32> {
+  return persistentCommit<Vector<4, Bytes<32>>>(
+    [pad(32, "phantom:mandate:state:"), registryId, mCm, spent as Field as Bytes<32>],
+    rand
+  );
+}
+
+// Nullifier of a state note. Derived from the SHARED mandate secret, because revocation is the
+// principal consuming the live state - so the principal must be able to compute this too.
+export circuit stateNullifier(secret: Bytes<32>, stateCm: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<4, Bytes<32>>>(
+    [pad(32, "phantom:mandate:snul:"), registryId, secret, stateCm]
+  );
+}
+
+// The allow-list root implied by the witness path for `counterparty`. A principal calls this
+// LOCALLY while building a mandate, so the root it seals in is computed by the same code that will
+// later check it. Reimplementing Midnight's Merkle hashing in TypeScript to do this would put the
+// very thing being verified at risk of drift.
+//
+// It discloses its return value because an exported circuit must. That is harmless here - the caller
+// already knows the root, it is their own list - but it does mean calling this ON-CHAIN would
+// publish it. Clients call it locally; nothing in this contract calls it.
+export circuit allowRootFor(counterparty: Bytes<32>): Field {
+  const ap = allowPath(counterparty);
+  assert(disclose(ap.leaf == counterparty), "allow-list path is not for this counterparty");
+  return disclose(merkleTreePathRoot<8, Bytes<32>>(ap).field);
+}
+
+// ── shared checks ──────────────────────────────────────────────────────────────
+
+// Re-derive the mandate from the holder's witnesses and prove it was really issued.
+// Returns the commitment so the caller can bind the state note to it.
+circuit openMandate(): Bytes<32> {
+  const mCm = mandateCommit(
+    mandatePrincipalPk(), mandateAgentPk(), mandateLimit(), mandateExpiry(),
+    mandateAllowRoot(), mandateRand()
+  );
+  const p = mandatePath(mCm);
+  // ⚠️ binds the membership proof to THIS mandate. See the header.
+  assert(disclose(p.leaf == mCm), "mandate path is not for this mandate");
+  assert(mandates.checkRoot(disclose(merkleTreePathRoot<20, Bytes<32>>(p))), "mandate was never issued");
+  return mCm;
+}
+
+// Consume the live state note: prove it is in the tree, then nullify it. Returns how much had been
+// spent, so the caller can enforce the limit against a number it did not choose.
+circuit consumeState(mCm: Bytes<32>, mSecret: Bytes<32>, spent: Uint<64>, step: Uint<64>): [] {
+  const sCm = stateCommit(mCm, spent, stateRand(mSecret, step));
+  const sp = statePath(sCm);
+  assert(disclose(sp.leaf == sCm), "state path is not for this state");
+  assert(states.checkRoot(disclose(merkleTreePathRoot<20, Bytes<32>>(sp))), "state note not in tree");
+
+  const nul = stateNullifier(mSecret, sCm);
+  // Publishing the nullifier is the point: it is what makes a rewind or a replay impossible.
+  assert(disclose(!spentStates.member(disclose(nul))), "this mandate state was already used");
+  spentStates.insert(disclose(nul));
+}
+
+// ── circuits ───────────────────────────────────────────────────────────────────
+
+// The principal issues a mandate. Nothing about it is readable on-chain: one commitment lands in
+// `mandates` and one state note (spent = 0) lands in `states`.
+//
+// Authorisation is the proof, not a caller check: the mandate binds `principalPk`, and only someone
+// holding `principalSecret` can produce a commitment that opens to it. Note the total absence of
+// `ownPublicKey()` - it is a WITNESS on Midnight, so using it for authorisation authorises nobody.
+export circuit issue(): [] {
+  const pPk = principalPk(principalSecret());
+  assert(disclose(pPk == mandatePrincipalPk()), "not the principal named in this mandate");
+
+  const mCm = mandateCommit(
+    pPk, mandateAgentPk(), mandateLimit(), mandateExpiry(), mandateAllowRoot(), mandateRand()
+  );
+  mandates.insert(mCm);
+  states.insert(stateCommit(mCm, 0, stateRand(mandateSecret(), 0)));
+}
+
+// The agent spends. Proves, revealing none of it: the mandate exists, the agent is its agent, the
+// counterparty is on the allow-list, the mandate has not expired, and the new total is within the
+// limit. Then rolls the state note forward.
+export circuit proveSpend(amount: Uint<64>, counterparty: Bytes<32>): [] {
+  const mCm = openMandate();
+
+  // The agent proves who it is by opening a commitment, never by being asked.
+  assert(disclose(agentPk(agentSecret()) == mandateAgentPk()), "not the agent named in this mandate");
+
+  // Counterparty ∈ allow-list. The allow-list is a client-side tree whose ROOT is sealed inside the
+  // mandate, so the list itself never touches the chain - only the proof that this one is on it.
+  const ap = allowPath(counterparty);
+  assert(disclose(ap.leaf == counterparty), "allow-list path is not for this counterparty");
+  assert(disclose(merkleTreePathRoot<8, Bytes<32>>(ap).field == mandateAllowRoot()),
+         "counterparty is not on the allow-list");
+
+  // Expiry. `disclose` is unavoidable: kernel arguments are a public boundary. See the header.
+  assert(kernel.blockTimeLessThan(disclose(mandateExpiry())), "mandate has expired");
+
+  // The limit. `spent` comes from the state note we are about to nullify, so the agent cannot
+  // choose it - the note's commitment binds it, and the tree binds the note.
+  const spent = stateSpent();
+  const step = stateStep();
+  const newSpent = spent + amount as Uint<64>;
+  assert(newSpent <= mandateLimit(), "spend would exceed the mandate limit");
+
+  consumeState(mCm, mandateSecret(), spent, step);
+  states.insert(stateCommit(mCm, newSpent, stateRand(mandateSecret(), step + 1 as Uint<64>)));
+}
+
+// The principal revokes: consume the live state note and create NO successor. With no live state
+// there is nothing for `proveSpend` to nullify, so the mandate is dead - permanently, and without
+// a public "revoked" list that would otherwise link every spend of the same mandate.
+export circuit revoke(): [] {
+  const pPk = principalPk(principalSecret());
+  assert(disclose(pPk == mandatePrincipalPk()), "only the principal can revoke");
+  const mCm = openMandate();
+  consumeState(mCm, mandateSecret(), stateSpent(), stateStep());
+}

@@ -1,0 +1,318 @@
+// RelayerRegistry - who the operators are, what they have staked, and how they leave.
+//
+// Spec: ../docs/12_RELAYER_NETWORK.md §4. Stake is PPT (PPT.compact), locked here.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// WHAT IS DELIBERATELY NOT IN THIS FILE
+//
+//   slash, challenge, proveCensorship, disputeReceipt
+//
+// If any of those appears here later, the reasoning in 11_TOKEN_DESIGN §3 has been lost and the
+// change should be rejected on that ground alone. The short version: a relayer AUTHORS NOTHING. On
+// Midnight it hands `balanceFinalizedTransaction` a transaction the user already proved and signed;
+// on the execution chain the pool verifies a user-generated proof with the recipient bound into it.
+// So there is no fault to punish. The one real failure - refusing to act - leaves no on-chain
+// artefact, so slashing for it would be a committee reading off-chain evidence. Liveness gets a
+// liveness answer: more than one operator, and a user who can always submit their own transaction.
+//
+// This contract therefore takes stake and gives it back. It never confiscates.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// EVERYTHING HERE IS PUBLIC, AND THAT IS THE POINT
+//
+// `operators` and `totalStaked` are readable by anyone. Priority is proportional to stake, and a
+// share is only a rule if the numerator and the denominator are both checkable - otherwise
+// "proportional to stake" degrades into "whatever the operator claims". Same argument that makes
+// PPT unshielded (PPT.compact header). No user's data is here: an operator's balance sheet was
+// never the secret.
+//
+// Note what is NOT stored: anything about a user, a job, or a transaction. This registry knows about
+// operators only.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// AUTHORISATION IS A PROOF, NEVER A CALLER CHECK
+//
+// `ownPublicKey()` is a WITNESS on Midnight - the caller supplies it - so a contract that gates on
+// it authorises nobody. Each operator is keyed by `operatorPk = H(domain, registryId, secret)`, and
+// every circuit that touches a record re-derives that key from a witnessed secret. Holding the
+// secret IS being the operator. (Same construction as MandateRegistry's principal and PPT's issuer.)
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// THE UNBONDING DELAY, AND THE TWO WAYS IT GETS WRITTEN WRONG
+//
+// Withdrawal is two-phase - request, wait, withdraw - so that priority cannot be rented for a single
+// burst and handed back. The wait is the whole mechanism, so both of its edges are guarded:
+//
+//   TOO NEAR.  `requestUnbond` will not accept a date less than `unbondingSeconds` away. Without
+//              this the operator picks their own release time and the delay is decorative.
+//
+//   TOO FAR.   It also will not accept a date more than 30 days away. That bound is not tidiness -
+//              it is the trap. ⚠️ `kernel.blockTime*` compares in SECONDS SINCE THE EPOCH, while
+//              every JavaScript timestamp (`Date.now()`, the indexer's `block.timestamp`) is in
+//              MILLISECONDS. A ms value is ~1000x too large, so it sails through any "far enough in
+//              the future" check and lands ~55,000 years out. The stake would be locked forever, by
+//              a client bug, with no error anywhere. The horizon bound turns that into a rejection
+//              at the door.
+//
+// Measured, not assumed - `tools/time-probe.mjs` on devnet and again in the simulator 2026-08-12:
+//     blockTime > now-1h in SECONDS -> PASS      blockTime > now-1h in MS -> FAIL
+//     blockTime > now+1h in SECONDS -> FAIL      blockTime > now+1h in MS -> FAIL
+//
+// And a second measurement that changed how this is tested. The simulator's block clock is sampled
+// ONCE, when the CircuitContext is created, and does NOT advance while that context is alive: the
+// first version of the test slept 73 real seconds and was still refused with "still unbonding" - the
+// contract's own message, which reads like the contract being right rather than the test being
+// broken. `createCircuitContext`'s 7th argument sets the block time explicitly, AS A NUMBER OF
+// SECONDS (it is used as `BigInt(time ?? Date.now()/1000)`, so a `Date` object silently becomes
+// milliseconds - the same units bug as above, one layer down, in the harness).
+//
+// So test/registry.test.mjs proves the delay by re-entering the SAME state in a LATER BLOCK:
+// refused at `release - 1`, allowed at `release + 1`, with nothing but the block clock differing.
+//
+// `unbondingSeconds` is a DEPLOYMENT parameter with a floor, not a constant. Different deployments
+// want different economics - preview wants minutes so the flow can be exercised, a live network wants
+// days - but zero must be impossible, or "unbonding" is a word in a document. The floor is the
+// contract's job; the value is governance's.
+
+pragma language_version >= 0.23;
+
+import CompactStandardLibrary;
+
+// The smallest unbonding period this contract will accept at deployment. A minute, not a week: the
+// economic value belongs to whoever deploys, and what must be enforced in bytecode is that the delay
+// EXISTS. A live network is expected to deploy days - recorded in the deploy script, not here.
+export pure circuit minUnbondingSeconds(): Uint<64> {
+  return 60;
+}
+
+// 30 days. Any release date further out than this is refused - see the header: this is the guard
+// that catches a millisecond timestamp before it locks someone's stake for 55,000 years.
+export pure circuit maxUnbondHorizonSeconds(): Uint<64> {
+  return 2592000;
+}
+
+struct Operator {
+  stake: Uint<128>,        // counted for priority
+  unbonding: Uint<128>,    // requested for withdrawal - earns nothing, counts for nothing
+  unbondAt: Uint<64>,      // SECONDS since the epoch. 0 = no request outstanding
+  nightPk: Bytes<32>,      // the DUST-generating identity, for liveness checks
+  endpoint: Bytes<32>,     // how a user reaches this operator
+  joinedEpoch: Uint<64>,
+  active: Boolean,
+}
+
+export sealed ledger registryId: Bytes<32>;
+
+// Which token counts as stake. Sealed, because the colour is tokenType(pptTokenId, pptContract) and
+// changing either would orphan every stake already locked here.
+export sealed ledger pptTokenId: Bytes<32>;
+export sealed ledger pptContract: ContractAddress;
+
+export sealed ledger unbondingSeconds: Uint<64>;
+export sealed ledger governancePkCommit: Bytes<32>;
+
+export ledger operators: Map<Bytes<32>, Operator>;
+
+// The denominator of every priority share. Counts ACTIVE stake only - see `requestUnbond`.
+export ledger totalStaked: Uint<128>;
+
+// The 40 / 20 / 40 split (11_TOKEN_DESIGN §4.3). Governed, and constrained to sum to 10000 so a
+// governance slip cannot quietly create or destroy fee revenue.
+export ledger feeOperatorBps: Uint<64>;
+export ledger feeBurnBps: Uint<64>;
+export ledger feeTeamBps: Uint<64>;
+
+export ledger epoch: Counter;
+
+constructor(
+  id: Bytes<32>, pptId: Bytes<32>, ppt: ContractAddress,
+  unbondSeconds: Uint<64>, governance: Bytes<32>,
+) {
+  assert(disclose(unbondSeconds) >= minUnbondingSeconds(),
+         "unbonding period is below the floor - a delay of zero is not a delay");
+  registryId = disclose(id);
+  pptTokenId = disclose(pptId);
+  pptContract = disclose(ppt);
+  unbondingSeconds = disclose(unbondSeconds);
+  governancePkCommit = disclose(governance);
+  feeOperatorBps = 4000;
+  feeBurnBps = 2000;
+  feeTeamBps = 4000;
+}
+
+witness operatorSecret(): Bytes<32>;
+witness governanceSecret(): Bytes<32>;
+
+// ── derivations ────────────────────────────────────────────────────────────────
+
+export circuit operatorPk(secret: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<3, Bytes<32>>>([pad(32, "phantom:relayer:op:"), registryId, secret]);
+}
+
+export circuit governancePk(secret: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<3, Bytes<32>>>([pad(32, "phantom:relayer:gov:"), registryId, secret]);
+}
+
+// The colour a stake must be. Derived from the sealed PPT identity rather than stored, so it cannot
+// drift from what the constructor was given.
+export circuit stakeColor(): Bytes<32> {
+  return tokenType(pptTokenId, pptContract);
+}
+
+// ── shared checks ──────────────────────────────────────────────────────────────
+
+// Re-derive the caller's key from their witnessed secret and load their record. Holding the secret
+// is the authorisation; there is no caller identity to check and none is consulted.
+// It returns the DISCLOSED key, and that is not a shortcut. `persistentHash` does not clear witness
+// taint (only the commit functions do), so `operatorPk(operatorSecret())` stays tagged all the way
+// through - and every caller ends in `operators.insert(pk, …)`, a public boundary. Disclosing once,
+// here, at the point where the key provably names a REGISTERED operator, is both the honest place
+// and the only place: the alternative is `disclose(pk)` sprinkled through six circuits, where one
+// omission is a compile error and one extra is a habit nobody questions.
+//
+// What is disclosed is a hash of the secret, never the secret. That the key is public is the design:
+// `operators` is a public map and has to be.
+circuit openOperator(): [Bytes<32>, Operator] {
+  const key = disclose(operatorPk(operatorSecret()));
+  assert(operators.member(key), "not a registered operator");
+  return [key, operators.lookup(key)];
+}
+
+circuit assertGovernance(): [] {
+  assert(disclose(governancePk(governanceSecret()) == governancePkCommit), "not governance");
+}
+
+// ── circuits ───────────────────────────────────────────────────────────────────
+
+// Join the network by locking PPT. The transaction must actually carry the coins for it to balance,
+// so the recorded stake cannot run ahead of what was really deposited.
+export circuit register(nightPk: Bytes<32>, endpoint: Bytes<32>, amount: Uint<128>): [] {
+  const pk = operatorPk(operatorSecret());
+  assert(disclose(!operators.member(disclose(pk))), "already registered");
+  assert(disclose(amount) > 0, "a registration with no stake is not a capacity claim");
+
+  receiveUnshielded(stakeColor(), disclose(amount));
+
+  operators.insert(disclose(pk), Operator {
+    stake: disclose(amount), unbonding: 0, unbondAt: 0,
+    nightPk: disclose(nightPk), endpoint: disclose(endpoint),
+    joinedEpoch: epoch.read(), active: true,
+  });
+  totalStaked = (totalStaked + disclose(amount)) as Uint<128>;
+}
+
+export circuit topUp(amount: Uint<128>): [] {
+  const opened = openOperator();
+  const pk = opened[0];
+  const rec = opened[1];
+  assert(disclose(amount) > 0, "top-up of zero");
+
+  receiveUnshielded(stakeColor(), disclose(amount));
+
+  operators.insert(pk, Operator {
+    stake: (rec.stake + disclose(amount)) as Uint<128>, unbonding: rec.unbonding,
+    unbondAt: rec.unbondAt, nightPk: rec.nightPk, endpoint: rec.endpoint,
+    joinedEpoch: rec.joinedEpoch, active: rec.active,
+  });
+  totalStaked = (totalStaked + disclose(amount)) as Uint<128>;
+}
+
+// Start the clock on a withdrawal. `unbondAt` is chosen by the caller and bounded on BOTH sides -
+// see the header for why the far side is the one that bites.
+//
+// The amount leaves `stake` and leaves `totalStaked` IMMEDIATELY, before the wait has elapsed.
+// That is deliberate: `totalStaked` is the denominator of everyone's priority share, and capital
+// that has announced it is leaving should stop buying capacity the moment it announces. Leaving it
+// in until withdrawal would let an operator hold priority through its own exit.
+export circuit requestUnbond(amount: Uint<128>, unbondAt: Uint<64>): [] {
+  const opened = openOperator();
+  const pk = opened[0];
+  const rec = opened[1];
+
+  assert(disclose(amount) > 0, "unbond of zero");
+  assert(disclose(amount) <= rec.stake, "cannot unbond more than is staked");
+  assert(disclose(rec.unbondAt) == 0, "an unbond request is already outstanding");
+
+  // Checked before either subtraction below, so an absurdly small `unbondAt` is a clear rejection
+  // rather than an arithmetic failure from a line the caller did not write.
+  assert(disclose(unbondAt) > unbondingSeconds, "unbonding delay is too short");
+  assert(disclose(unbondAt) > maxUnbondHorizonSeconds(), "unbond date is not a plausible timestamp");
+
+  // now + unbondingSeconds <= unbondAt
+  assert(kernel.blockTimeLessThan((disclose(unbondAt) - unbondingSeconds) as Uint<64>),
+         "unbonding delay is too short");
+  // unbondAt <= now + 30 days   - the millisecond guard
+  assert(kernel.blockTimeGreaterThan((disclose(unbondAt) - maxUnbondHorizonSeconds()) as Uint<64>),
+         "unbond date is unreasonably far away - a millisecond timestamp looks exactly like this");
+
+  operators.insert(pk, Operator {
+    stake: (rec.stake - disclose(amount)) as Uint<128>,
+    unbonding: (rec.unbonding + disclose(amount)) as Uint<128>,
+    unbondAt: disclose(unbondAt), nightPk: rec.nightPk, endpoint: rec.endpoint,
+    joinedEpoch: rec.joinedEpoch, active: rec.active,
+  });
+  totalStaked = (totalStaked - disclose(amount)) as Uint<128>;
+}
+
+// Take the stake back once the wait has elapsed. This is the ONLY circuit that moves PPT out of the
+// registry, and it can only ever move an amount the caller themselves put into `unbonding`.
+export circuit withdrawStake(recipient: Either<ContractAddress, UserAddress>): [] {
+  const opened = openOperator();
+  const pk = opened[0];
+  const rec = opened[1];
+
+  assert(disclose(rec.unbondAt) != 0, "no unbond request is outstanding");
+  assert(kernel.blockTimeGreaterThan(rec.unbondAt), "still unbonding");
+
+  operators.insert(pk, Operator {
+    stake: rec.stake, unbonding: 0, unbondAt: 0,
+    nightPk: rec.nightPk, endpoint: rec.endpoint,
+    joinedEpoch: rec.joinedEpoch, active: rec.active,
+  });
+  sendUnshielded(stakeColor(), rec.unbonding, disclose(recipient));
+}
+
+// Leave, or come back, without touching the stake. A graceful exit is not a fault: an operator that
+// stops serving simply stops earning, which is the entire enforcement mechanism (§3).
+export circuit setActive(on: Boolean): [] {
+  const opened = openOperator();
+  const pk = opened[0];
+  const rec = opened[1];
+  operators.insert(pk, Operator {
+    stake: rec.stake, unbonding: rec.unbonding, unbondAt: rec.unbondAt,
+    nightPk: rec.nightPk, endpoint: rec.endpoint,
+    joinedEpoch: rec.joinedEpoch, active: disclose(on),
+  });
+}
+
+// Update where a user reaches this operator. Cheap, and the alternative - re-registering - would
+// reset `joinedEpoch` and force the stake through an unbonding cycle to move a hostname.
+export circuit setEndpoint(endpoint: Bytes<32>): [] {
+  const opened = openOperator();
+  const pk = opened[0];
+  const rec = opened[1];
+  operators.insert(pk, Operator {
+    stake: rec.stake, unbonding: rec.unbonding, unbondAt: rec.unbondAt,
+    nightPk: rec.nightPk, endpoint: disclose(endpoint),
+    joinedEpoch: rec.joinedEpoch, active: rec.active,
+  });
+}
+
+// ── governance ─────────────────────────────────────────────────────────────────
+
+// The 40/20/40 split. Constrained to total exactly 10000 - a split that sums to less silently
+// destroys fee revenue and one that sums to more silently creates it, and neither shows up as an
+// error anywhere downstream.
+export circuit setFeeSplit(operatorBps: Uint<64>, burnBps: Uint<64>, teamBps: Uint<64>): [] {
+  assertGovernance();
+  assert(disclose(operatorBps) + disclose(burnBps) + disclose(teamBps) == 10000,
+         "the fee split must total exactly 100%");
+  feeOperatorBps = disclose(operatorBps);
+  feeBurnBps = disclose(burnBps);
+  feeTeamBps = disclose(teamBps);
+}
+
+export circuit advanceEpoch(): [] {
+  assertGovernance();
+  epoch.increment(1);
+}

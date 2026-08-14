@@ -1,0 +1,200 @@
+// PPT - the Phantom Protocol token. 1,000,000,000, fixed, on Midnight.
+//
+// Spec: ../docs/11_TOKEN_DESIGN.md. Four owner decisions are binding here and this file is where
+// they stop being prose: ticker PPT, supply 1e9 fixed, fee split 40/20/40, and NO SLASHING.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// WHY THIS TOKEN IS UNSHIELDED, IN A PROTOCOL WHOSE WHOLE POINT IS PRIVACY
+//
+// A reasonable reader gets to this line and assumes an oversight. It is a decision, and it is the
+// one worth arguing about first.
+//
+// PPT does exactly two jobs (11_TOKEN_DESIGN §4.2): it is a CAPACITY CLAIM and a GOVERNANCE WEIGHT.
+// Both are claims against everyone else. "Priority is proportional to stake" is only a rule if any
+// operator can check that the ordering was honoured; if stakes are hidden, "proportional to stake"
+// becomes "whatever the sequencer says", and the rationing of a genuinely scarce resource rests on
+// trust - the one thing this protocol exists to remove.
+//
+// Same for the supply. "1,000,000,000 fixed" is a PROPERTY when anyone can count it and a MARKETING
+// CLAIM when they cannot.
+//
+// And the privacy that matters is not lost, because PPT is deliberately never in a user's payment
+// path (§4.4). A user pays fees in the asset they are already moving. What stays private is the
+// NOTE - who paid whom, how much - and that lives in NotePool.compact, where it belongs. An
+// operator's balance sheet was never the secret.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// THE TRAP THIS CONTRACT IS SHAPED AROUND: A CAP ON THE WRONG NUMBER
+//
+// The obvious fixed-supply contract keeps ONE counter - "supply" - bumps it on mint, drops it on
+// burn, and refuses to mint past the cap. Every individual check passes. The cap does not hold:
+//
+//     issue(1e9)  → supply 1e9, at the cap, further issuance refused
+//     burn(1e9)   → supply 0
+//     issue(1e9)  → allowed again
+//
+// Repeat forever. Supply never reads above the cap at any instant, and the token is uncapped. The
+// bug is not in the assert; the assert is correct about the number it is given. It is in the CHOICE
+// of number: a burn is not an un-mint.
+//
+// So there are two counters and only one of them is ever compared to the cap:
+//
+//     issued   - CUMULATIVE, monotone, never decreases for any reason. The cap is on THIS.
+//     burned   - cumulative destruction, for accounting only. It NEVER frees issuance headroom.
+//     circulating = issued - burned
+//
+// `burn` deliberately does not touch `issued`. That single omission is the fixed supply.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// WHY "BURN" HERE MEANS UNSPENDABLE, NOT DESTROYED - stated plainly, because the difference is real
+//
+// Unshielded coins sent to this contract are credited to its balance. This file contains NO circuit
+// that calls `sendUnshielded`, so nothing can ever move them out again: not the issuer, not
+// governance, not an upgrade (a Compact contract's circuits are fixed at deployment). They are
+// permanently unspendable, which is what "burned" buys you economically.
+//
+// It is NOT a reduction of the ledger's own total. Anyone auditing this should read `circulating`
+// as "issued minus provably stranded", and should verify the claim the same way it is made here -
+// by checking that no send path exists in this source.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// AUTHORISATION IS A PROOF, NEVER A CALLER CHECK
+//
+// `ownPublicKey()` is a WITNESS on Midnight - the caller supplies it - so gating issuance on it
+// authorises nobody at all. (Same trap documented in MandateRegistry.compact; it is the single
+// easiest way to write a contract that looks guarded and is not.) The issuer instead proves
+// knowledge of the secret behind the sealed `issuerPk`, exactly as a mandate's principal does.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// THERE IS NO SLASH CIRCUIT, AND THAT IS THE DESIGN
+//
+// 11_TOKEN_DESIGN §3: a relayer authors nothing on either leg, so it cannot commit a punishable
+// fault; and the one real fault - refusing to act - leaves no on-chain artefact to prove. A bond on
+// top of an impossibility costs an operator real capital and buys nothing.
+//
+// Concretely: NO circuit in this file can move PPT away from a holder. If one ever appears here,
+// §3 has been lost and the reviewer should reject the change on that ground alone.
+//
+// ─────────────────────────────────────────────────────────────────────────────
+// UNITS
+//
+// 6 decimals, so 1 PPT = 1_000_000 base units and the whole supply is 1e15 base units.
+// Not copied from another chain's habit - NIGHT itself is 6 decimals, measured from this repo's own
+// preview reading (tools/logs/dust-generation.json: nightTotal 7500000000 for 7500 tNIGHT). Matching
+// it means a wallet showing both never has to special-case one of them.
+//
+// The ceiling is `mintUnshieldedToken`'s Uint<64> value: 18_446_744_073_709_551_615. At 6 decimals
+// the entire supply is 1e15, ~18,400x under it. At 18 decimals it would be 1e27 and would not fit
+// at all - the token would have been undeployable for a reason that has nothing to do with economics.
+
+pragma language_version >= 0.23;
+
+import CompactStandardLibrary;
+
+// 1,000,000,000 PPT at 6 decimals. Compile-time: changing it is a different token.
+//
+// A `pure circuit` rather than a module constant because Compact 0.31.1 has no module-level `const`
+// - the parser rejects it outright at the top level, with or without `export`. Exporting it is the
+// better shape anyway: the cap becomes something a client can READ from the deployed contract
+// instead of a number it has to be told and trust.
+export pure circuit totalSupply(): Uint<64> {
+  return 1000000000000000;
+}
+
+// Domain separator for this deployment's token colour. Sealed: the colour is
+// tokenType(tokenId, thisContract), so moving it would orphan every coin already issued.
+export sealed ledger tokenId: Bytes<32>;
+
+// Who may issue, as a hash. The secret behind it never touches the chain.
+export sealed ledger issuerPkCommit: Bytes<32>;
+
+// CUMULATIVE issuance. Monotone by construction - the cap is on this and only this.
+export ledger issued: Uint<64>;
+
+// CUMULATIVE destruction. Accounting only; never subtracted from `issued`.
+export ledger burned: Uint<64>;
+
+constructor(id: Bytes<32>, issuer: Bytes<32>) {
+  tokenId = disclose(id);
+  issuerPkCommit = disclose(issuer);
+}
+
+// The issuer's secret. Untrusted like every witness: it is checked against the sealed commitment,
+// never believed.
+witness issuerSecret(): Bytes<32>;
+
+// ── derivations ────────────────────────────────────────────────────────────────
+
+// Exported so the deployer computes `issuerPkCommit` with THIS contract rather than with a
+// TypeScript reimplementation of Midnight's hashing - the drift that pattern invites is silent, and
+// it would lock the token's issuance behind an unreachable key.
+export circuit issuerPk(secret: Bytes<32>): Bytes<32> {
+  return persistentHash<Vector<3, Bytes<32>>>([pad(32, "phantom:ppt:issuer:"), tokenId, secret]);
+}
+
+// The colour of PPT: what a wallet filters on and what RelayerRegistry must require of a stake.
+// Deterministic from (tokenId, this address), so it is derived rather than stored - a stored copy is
+// a second source of truth that can disagree with the first.
+export circuit pptColor(): Bytes<32> {
+  return tokenType(tokenId, kernel.self());
+}
+
+// ── circuits ───────────────────────────────────────────────────────────────────
+
+// Issue up to the cap, to a user or to a contract.
+//
+// Not a one-shot genesis mint of the whole supply: allocation and vesting are still open business
+// decisions (11_TOKEN_DESIGN §7 Q5), and a contract that forces them to be settled today would be
+// answering a question nobody has answered. Capped incremental issuance defers that without
+// weakening the cap - `issued` is monotone, so the total across every call in history is bounded by
+// TOTAL_SUPPLY whatever order the allocations happen in.
+export circuit issue(amount: Uint<64>, recipient: Either<ContractAddress, UserAddress>): [] {
+  assert(disclose(issuerPk(issuerSecret()) == issuerPkCommit), "not the issuer");
+  assert(disclose(amount) > 0, "issue of zero");
+
+  // The addition happens on the WIDER type `+` produces, and the cap is asserted BEFORE the
+  // narrowing cast.
+  //
+  // MEASURED, because the reason matters and the obvious reason is wrong. On most languages the
+  // danger of narrowing first is silent wraparound: at the cap, an `amount` of 2^64 - TOTAL_SUPPLY
+  // sums to exactly 2^64, narrows to 0, and walks past a cap check reading the wrong number -
+  // minting 17.4 quintillion units and resetting `issued` in one call. **Compact does not wrap.**
+  // The mutant was built and executed (test/ppt.mutate.mjs, the LANGUAGE GUARANTEE probe) and the
+  // runtime refused the cast outright:
+  //
+  //     cast from Field or Uint value to smaller Uint value failed:
+  //     18446744073709551616 is greater than 18446744073709551615
+  //
+  // So the supply is safe either way, and this ordering is not what makes it safe - the checked cast
+  // is. What the ordering buys is the failure a caller can act on ("issue would exceed the fixed
+  // supply") instead of a cast error from a line they did not write. Keep it for that reason, and do
+  // not repeat the wraparound claim: on this compiler it is not true.
+  const next = issued + disclose(amount);
+  assert(next <= totalSupply(), "issue would exceed the fixed supply");
+  issued = next as Uint<64>;
+
+  mintUnshieldedToken(tokenId, disclose(amount), disclose(recipient));
+}
+
+// Destroy PPT by parking it where nothing can retrieve it. Permissionless on purpose: a burn only
+// ever costs the burner, and the 20% buy-back-and-burn share (§4.3) is executed by whoever holds the
+// treasury, which should not need this contract's permission to give value up.
+//
+// `issued` is untouched. See the header: that is the fixed supply, not the assert above.
+export circuit burn(amount: Uint<64>): [] {
+  assert(disclose(amount) > 0, "burn of zero");
+  const next = burned + disclose(amount);
+  assert(next <= issued, "cannot burn more than was ever issued");
+  burned = next as Uint<64>;
+
+  // The transaction must actually carry these coins for it to balance, so the counter cannot run
+  // ahead of reality: a caller who claims a burn without supplying the coins produces an
+  // unbalanced transaction that the ledger rejects.
+  receiveUnshielded(pptColor(), disclose(amount) as Uint<128>);
+}
+
+// issued - burned. A circuit rather than a stored field for the same reason `pptColor` is: a third
+// counter maintained alongside two others is a third thing that can disagree with them.
+export circuit circulating(): Uint<64> {
+  return (issued - burned) as Uint<64>;
+}
