@@ -83,11 +83,20 @@ be searching for.
 
 ## What is not claimed here
 
-The BSC leg of the joint-note settlement is proven on chain but is **not wired to any button** yet -
-and the live product says so on the page rather than letting a viewer assume. Two measurements in
-[`measurements/`](measurements/) carry explicit caveats about what they do *not* establish.
+The BSC leg of the joint-note settlement is now **wired and live**: the browser builds its own
+`transfer` and `spend_joint` proofs, and both are accepted by their deployed BSC verifiers, each
+checked with a negative control so that "it accepted" cannot be confused with "it accepts anything".
+What has **not** happened yet is one real lock and release through that button on the live pool, so
+the capability is reachable and not yet exercised end to end. Those are different claims and this
+file keeps them apart.
 
-I would rather report a gap than round it up.
+Two measurements in [`measurements/`](measurements/) carry explicit caveats about what they do *not*
+establish, for the same reason.
+
+I would rather report a gap than round it up. This paragraph previously said the BSC leg was not
+wired at all - true when written, quietly false the moment it shipped. A stale claim in a README
+fails exactly the way a stale comment in code does, and it is the reason every number above carries
+a block height you can check rather than a date I remembered.
 
 ---
 
